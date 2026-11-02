@@ -6017,6 +6017,112 @@ def _hl_accounts_cache_copy():
         return copy.deepcopy(_HL_ACCOUNTS_CACHE)
 
 
+# -- Hyperliquid spot holdings, display only (Landing 85, Nov 1) -----------
+# The balances compose_total already counts in its "hyperliquid" part (part 7),
+# shown on Token Holdings and in the Spot page's wallet line. They are NEVER
+# added to portfolio["tokens"], token_snapshots or compose_total's inputs: that
+# would count them again in the total's Wallet tokens / Stablecoins parts and
+# in the stored history, and would put Hyperliquid USDC (perp margin, ruled
+# Nov 1) into Spot's Dry powder. tests/test_hl_spot_holdings.py pins that no
+# snapshot, total or Dry powder code reads these helpers.
+HL_SPOT_VENUE_SUFFIX = ' App'      # Glenn, Nov 1: the Spot line reads "<wallet label> App"
+# Unit-issued Hyperliquid spot coins and the asset each stands for. Used only
+# to match a Spot position that has no chain recorded (the BTC / ETH / SOL
+# kind) and to group the coin with its asset on Token Holdings.
+# [Inference] the coin names come from memory of Hyperliquid's spot list, not
+# from a read of it in this build.
+HL_SPOT_ALIASES = {'UBTC': 'BTC', 'UETH': 'ETH', 'USOL': 'SOL'}
+
+
+def _hl_spot_wallet_label(addr, config):
+    """A wallet's Settings label (exact key, else case-insensitive), or
+    "Unlabelled wallet". Labels only, never the address."""
+    entry = config.get(addr)
+    if entry is None:
+        entry = next((v for k, v in config.items() if str(k).lower() == str(addr).lower()), None)
+    label = str(entry.get('label') or '').strip() if isinstance(entry, dict) else ''
+    return label or 'Unlabelled wallet'
+
+
+def _hl_spot_holdings(state, config, visible):
+    """Display rows from a Hyperliquid accounts cache snapshot (no call, no
+    write). state: _hl_accounts_cache_copy(); config: load_wallet_config();
+    visible: the lowercased addresses of the visible EVM wallets (a wallet
+    hidden after the last refresh is left out).
+
+    One row per wallet and coin with a positive amount: {"wallet" (the address,
+    for the page's wallet chips), "wallet_label", "venue_label" (label +
+    HL_SPOT_VENUE_SUFFIX), "coin", "canonical" (HL_SPOT_ALIASES applied, upper
+    case), "balance", "price_usd", "value_usd" (None when the coin has no USDC
+    price), "priced", "margin" (the coin is USDC), "stale" (this wallet's last
+    refresh failed and the row is its last good one)}. Sorted by wallet label,
+    then value, largest first, then coin."""
+    rows = []
+    for addr, w in (state.get('wallets') or {}).items():
+        if str(addr).lower() not in visible or not isinstance(w, dict):
+            continue
+        label = _hl_spot_wallet_label(addr, config)
+        for s in w.get('spot') or []:
+            if not isinstance(s, dict):
+                continue
+            amount = portfolio_total._num_or_none(s.get('amount'))
+            coin = str(s.get('coin') or '').strip()
+            if amount is None or amount <= 0 or not coin:
+                continue
+            price = portfolio_total._num_or_none(s.get('price'))
+            value = portfolio_total._num_or_none(s.get('value'))
+            priced = price is not None and value is not None
+            canonical = HL_SPOT_ALIASES.get(coin.upper(), coin.upper())
+            rows.append({"wallet": addr, "wallet_label": label, "venue_label": label + HL_SPOT_VENUE_SUFFIX,
+                         "coin": coin, "canonical": canonical, "balance": amount,
+                         "price_usd": price if priced else None, "value_usd": value if priced else None,
+                         "priced": priced, "margin": coin.upper() == 'USDC', "stale": bool(w.get('stale'))})
+    rows.sort(key=lambda r: (r["wallet_label"], -(r["value_usd"] or 0.0), r["coin"]))
+    return rows
+
+
+@app.route('/api/portfolio/hyperliquid-spot')
+def api_portfolio_hyperliquid_spot():
+    """Hyperliquid spot balances for Token Holdings (Landing 85). DISPLAY ONLY.
+
+    Cache-only: reads the Hyperliquid accounts cache the complete total uses
+    (never calls Hyperliquid on the request path) and starts its 15-minute
+    background refresh through _maybe_kick_hl_accounts_refresh, so Token
+    Holdings keeps the cache warm too. No DB read or write, and
+    _portfolio_cache is never touched: these rows must not reach the wallet
+    snapshots, compose_total or Dry powder (see _hl_spot_holdings).
+
+    Returns {"status", "as_of", "rows", "unread", "refresh_failed"}.
+    status "loading": the cache has never been filled (a refresh is starting);
+    "error": the first refresh failed (no error text is returned: it can carry
+    wallet addresses); "ok": rows from the cache, as_of its fetch time (ISO).
+    unread: labels of wallets whose last refresh failed with no earlier good
+    read. refresh_failed: the latest refresh failed and the rows are older."""
+    now_utc = datetime.now(timezone.utc)
+    try:
+        _maybe_kick_hl_accounts_refresh(now_utc)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[hl-spot] refresh kick failed: {type(e).__name__}")
+    try:
+        state = _hl_accounts_cache_copy()
+        visible = {str(a).lower() for a in _hl_accounts_wallets()}
+        if not visible:
+            return jsonify({"status": "ok", "as_of": None, "rows": [], "unread": [], "refresh_failed": False})
+        if not state.get("fetched_at"):
+            return jsonify({"status": "error" if state.get("error") else "loading", "as_of": None, "rows": [],
+                            "unread": [], "refresh_failed": False})
+        config = load_wallet_config()
+        have = {str(a).lower() for a in (state.get("wallets") or {})}
+        unread = sorted({_hl_spot_wallet_label(a, config) for a in (state.get("wallet_errors") or {})
+                         if str(a).lower() in visible and str(a).lower() not in have})
+        return jsonify({"status": "ok", "as_of": state.get("fetched_at"),
+                        "rows": _hl_spot_holdings(state, config, visible), "unread": unread,
+                        "refresh_failed": bool(state.get("error"))})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': type(e).__name__}), 500
+
+
 @app.route('/api/portfolio/total')
 def api_portfolio_total():
     """Total portfolio value - one total plus its parts, each with value,
@@ -16700,6 +16806,22 @@ def api_spot_locations():
     or when its symbol is a native coin (_SPOT_LOCATION_NATIVE_SYMBOLS);
     otherwise "not found" would be untrue for a token that has a contract.
 
+    Hyperliquid (Landing 85): a symbol-keyed position is also matched against
+    the Hyperliquid spot balances in the accounts cache the complete total
+    uses (cache only: no call and no refresh kick, and a cold cache adds
+    nothing). A coin matches when its name equals the symbol or its Unit alias
+    does (HL_SPOT_ALIASES: UETH is ETH; a position keyed UETH matches UETH
+    alone). Hyperliquid USDC is perp margin, never a holding, so it matches
+    nothing. That wallet's entry is labelled "<label> App"
+    (HL_SPOT_VENUE_SUFFIX); its as_of is the cache's fetch time and it is stale
+    when that is over SPOT_LOCATION_STALE_HOURS old or the last refresh (of the
+    wallet, or of the whole cache) failed. A position with a chain and contract
+    never matches a Hyperliquid coin (a same-ticker coin there need not be the
+    same asset). The Hyperliquid part is isolated: if it fails, the route
+    answers as it did without it. It is skipped when no wallet has a completed
+    snapshot (the route then answers empty). Hyperliquid balances are not in
+    token_snapshots; the 1% floor applies to them too.
+
     Only COMPLETED runs are read (as the Dry powder card does): a run is
     marked 'partial' on any fetch failure, and which part failed is not
     stored, so a partial run may lack a wallet's tokens. When partial runs
@@ -16746,6 +16868,26 @@ def api_spot_locations():
         old = [(read_at.get(w), label_of(w)) for w in visible if read_at.get(w) is None or read_at[w] < stale_before]
         old.sort(key=lambda o: (o[0] is not None, o[0] or newest, o[1]))
         old_wallets = [{'label': lbl, 'as_of': at.isoformat() if at else None} for at, lbl in old]
+        # Hyperliquid spot (Landing 85): {SYMBOL: {wallet: {label, units, stale}}}, keyed
+        # by the asset (UETH counts under ETH) and by the coin's own name. Isolated:
+        # a failure here leaves the wallet line exactly as it was without Hyperliquid.
+        hl_at, hl_failed, hl_held = None, False, {}
+        try:
+            hl_state = _hl_accounts_cache_copy()
+            hl_at = parse(hl_state.get('fetched_at'))
+            hl_failed = bool(hl_state.get('error'))
+            if hl_at is not None:
+                for r in _hl_spot_holdings(hl_state, config, {str(w).lower() for w in visible}):
+                    if r['margin']:
+                        continue                  # USDC there is perp margin, not a holding
+                    for sym in {r['canonical'], r['coin'].upper()}:
+                        slot = hl_held.setdefault(sym, {}).setdefault(
+                            r['wallet'], {'label': r['venue_label'], 'units': 0.0, 'stale': False})
+                        slot['units'] += r['balance']
+                        slot['stale'] = slot['stale'] or r['stale']
+        except Exception as e:
+            print(f"[spot-locations] hyperliquid part skipped: {type(e).__name__}", flush=True)
+            hl_at, hl_failed, hl_held = None, False, {}
         positions = {}
         for key, pos in open_positions.items():
             units = float(pos.get('units') or 0)
@@ -16762,6 +16904,11 @@ def api_spot_locations():
                 wallets.append({'label': label_of(snaps[snap_id]['wallet']), 'units': amount,
                                 'as_of': at.isoformat() if at else None,
                                 'stale': at is None or at < stale_before})
+            if hl_at is not None and not isinstance(key, tuple):
+                for h in (hl_held.get(str(key).strip().upper()) or {}).values():
+                    if h['units'] > 0 and h['units'] >= floor:
+                        wallets.append({'label': h['label'], 'units': h['units'], 'as_of': hl_at.isoformat(),
+                                        'stale': h['stale'] or hl_failed or hl_at < stale_before})
             if not wallets and not isinstance(key, tuple) and str(key).strip().upper() not in _SPOT_LOCATION_NATIVE_SYMBOLS:
                 continue    # symbol-keyed, not a native coin, not found: unknown
             wallets.sort(key=lambda w: (-w['units'], w['label']))

@@ -1114,6 +1114,52 @@ function BorrowLendTab({ portfolio, hideValues, displayPrefs, onRefetch }) {
 
 // ─── Token Holdings tab ───────────────────────────────────────────────────────
 
+// Hyperliquid spot rows (Landing 85), display only. GET
+// /api/portfolio/hyperliquid-spot returns the balances the complete total
+// already counts in its Hyperliquid part. They are merged into this table
+// only and never enter portfolio.tokens (see web_portfolio._hl_spot_holdings).
+// USDC there is perp margin for unified accounts: it gets its own group and a
+// label, so it never reads as part of the Stablecoins figure. A Unit-issued
+// coin (UETH) is grouped with its asset (ETH) and keeps its own name.
+const HL_DOT = ' ' + String.fromCharCode(183) + ' ';
+const HL_MARGIN_GROUP = 'Hyperliquid margin';
+function hlSpotToTokenRows(resp) {
+  if (!resp || resp.status !== 'ok' || !Array.isArray(resp.rows)) return [];
+  return resp.rows.map(r => {
+    const coin = String(r.coin || '');
+    const priced = r.priced === true && Number.isFinite(r.value_usd);
+    const alias = r.canonical && r.canonical !== coin.toUpperCase() ? r.canonical : '';
+    // Every Hyperliquid row gets its group here, so none can fall into the
+    // Stablecoins group by its name: USDC (perp margin) and any other
+    // stablecoin-looking coin there (possible collateral) share one group.
+    const asset = tokenGroup(alias || coin);
+    return {
+      chain: 'hyperliquid', symbol: coin, source: 'hyperliquid',
+      display_symbol: r.margin ? 'USDC' + HL_DOT + 'Hyperliquid (perp margin)' : coin, hl_margin: r.margin === true,
+      chip_label: r.margin ? 'USDC' + HL_DOT + 'Hyperliquid' : coin,
+      avatar_symbol: r.canonical || coin,
+      _key: 'hl:' + coin.toUpperCase(),
+      _group: r.margin || asset === 'Stablecoins' ? HL_MARGIN_GROUP : asset,
+      _unpriced: !priced, hl_stale: r.stale === true,
+      balance: r.balance, price_usd: priced ? r.price_usd : null, value_usd: priced ? r.value_usd : 0,
+      contract: '', wallet: r.wallet, wallet_label: r.wallet_label, venue_label: r.venue_label,
+      is_zero_balance: false,
+    };
+  });
+}
+
+// The one-line note above the table when Hyperliquid balances are not all
+// there: still loading, unreadable, a wallet not read, or the last refresh failed.
+function hlSpotNotice(resp) {
+  if (!resp) return 'Hyperliquid balances are unavailable.';
+  if (resp.status === 'loading') return resp.gave_up ? 'Hyperliquid balances are still loading. Reload the page to ask again.' : 'Hyperliquid balances are loading...';
+  if (resp.status !== 'ok') return 'Hyperliquid balances could not be read.';
+  const parts = [];
+  if (Array.isArray(resp.unread) && resp.unread.length) parts.push('Hyperliquid not read for ' + resp.unread.join(', ') + '.');
+  if (resp.refresh_failed) parts.push('The last Hyperliquid refresh failed; those balances may be out of date.');
+  return parts.join(' ');
+}
+
 // Declutter custom-token zero rows. Per token: genuine-zero (token, wallet)
 // rows are hidden when the token holds a nonzero balance in another wallet;
 // a token that is zero in EVERY wallet collapses to one consolidated row
@@ -1144,6 +1190,7 @@ function consolidateCustomZeros(tokens) {
 // a custom ESHARE and a future Zerion-indexed ESHARE are one entry; symbol
 // fallback for rows without a contract (e.g. native ETH).
 function tokenKeyOf(t) {
+  if (t._key) return t._key;   // Hyperliquid rows: one key per coin, never shared with an on-chain token
   const c = String(t.contract || '').toLowerCase();
   return c ? 'c:' + c : 'sym:' + (t.symbol || '?');
 }
@@ -1258,7 +1305,7 @@ function AddCustomToken({ onAdded }) {
   </div>;
 }
 
-function TokenHoldings({ portfolio, wallets, hideValues, config, displayPrefs, onRefresh }) {
+function TokenHoldings({ portfolio, wallets, hideValues, config, displayPrefs, onRefresh, hlSpot }) {
   const [selectedWallets, setSelectedWallets] = useState(new Set());
   const [chainFilter, setChainFilter] = useState('all');
   const [groupMode, setGroupMode] = useState('type');
@@ -1322,11 +1369,16 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, displayPrefs, o
       is_zero_balance: false, _loading: true,
     })), [pendingAdds, presentCustomIds]);
 
+  // Hyperliquid spot balances (display only, Landing 85): their own request,
+  // merged here and nowhere else.
+  const hlRows = useMemo(() => hlSpotToTokenRows(hlSpot), [hlSpot]);
+  const hlNotice = hlSpotNotice(hlSpot);
+
   const allTokens = useMemo(() => {
     const base = portfolioTokens.filter(
       t => !(t.source === 'custom' && removedIds.has(t.custom_token_id)));
-    return consolidateCustomZeros([...base, ...pendingRows]);
-  }, [portfolioTokens, removedIds, pendingRows]);
+    return consolidateCustomZeros([...base, ...pendingRows, ...hlRows]);
+  }, [portfolioTokens, removedIds, pendingRows, hlRows]);
   const allWallets = wallets || [];
 
   const filtered = useMemo(() => {
@@ -1348,7 +1400,9 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, displayPrefs, o
     // so the notice (and the way back to "Hide dust") doesn't disappear the
     // instant dust is shown.
     filtered.forEach(t => {
-      const isDust = t.source !== 'custom' && t.value_usd < dustThreshold;
+      // A Hyperliquid coin with no USDC price has no value to test: it always
+      // shows (the honest-failure contract), like a failed custom read.
+      const isDust = t.source !== 'custom' && !t._unpriced && t.value_usd < dustThreshold;
       if (isDust) dust.push(t);
       if (!isDust || showDust) vis.push(t);
     });
@@ -1369,9 +1423,9 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, displayPrefs, o
   const tokenOptions = useMemo(() => {
     const seen = new Map();
     (allTokens ?? []).forEach(t => {
-      if (!(t.source === 'custom' || showDust || t.value_usd >= dustThreshold)) return;
+      if (!(t.source === 'custom' || t._unpriced || showDust || t.value_usd >= dustThreshold)) return;
       const k = tokenKeyOf(t);
-      if (!seen.has(k)) seen.set(k, t.symbol || '?');
+      if (!seen.has(k)) seen.set(k, t.chip_label || t.symbol || '?');
     });
     return [...seen.entries()].map(([key, label]) => ({ key, label }))
       .sort((a, b) => a.label.localeCompare(b.label));
@@ -1454,8 +1508,8 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, displayPrefs, o
       });
       return Object.values(map).sort((a,b) => b.total - a.total).map(g => ({ key:g.label, label:g.label, tokens:g.tokens.sort((a,b)=>b.value_usd-a.value_usd), total:g.total }));
     }
-    const map = { ETH:[], BTC:[], Stablecoins:[], Yield:[], Other:[] };
-    visible.forEach(t => { const g = tokenGroup(t.symbol); (map[g]||map.Other).push(t); });
+    const map = { ETH:[], BTC:[], Stablecoins:[], Yield:[], Other:[], [HL_MARGIN_GROUP]:[] };
+    visible.forEach(t => { const g = t._group || tokenGroup(t.symbol); (map[g]||map.Other).push(t); });
     return Object.entries(map).filter(([,v])=>v.length>0)
       .map(([key,tokens]) => ({ key, label:key, tokens:tokens.sort((a,b)=>b.value_usd-a.value_usd), total:tokens.reduce((s,t)=>s+t.value_usd,0) }))
       .sort((a,b) => b.total - a.total);
@@ -1531,6 +1585,9 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, displayPrefs, o
       </button>
     </div>}
 
+    {/* Hyperliquid balances not all there (Landing 85) */}
+    {hlNotice && <div style={{ fontSize:12, color:'var(--text3)', marginBottom:8 }}>{hlNotice}</div>}
+
     {/* Token table */}
     <div className="tv-card" style={{ padding:0, overflow:'hidden' }}>
       <table className="tv-table">
@@ -1548,8 +1605,9 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, displayPrefs, o
             </tr>
             {g.tokens.map((t,i) => <tr key={(t.wallet||'')+t.symbol+t.chain+(t.custom_token_id||'')+i} style={t._loading ? { opacity:0.65 } : undefined}>
               <td style={{ display:'flex', alignItems:'center', gap:8 }}>
-                <TokenAvatar symbol={t.symbol} size={20} />
-                <span style={{ fontWeight:600, color:'var(--text)' }}>{t.symbol}</span>
+                <TokenAvatar symbol={t.avatar_symbol || t.symbol} size={20} />
+                <span style={{ fontWeight:600, color:'var(--text)' }}
+                  title={t.hl_margin ? 'Hyperliquid USDC. For unified and portfolio-margin accounts this also holds the perp margin, so it is kept out of the Stablecoins group.' : undefined}>{t.display_symbol || t.symbol}</span>
                 {t.source === 'custom' && <span className="tv-chip" style={{ fontSize:10, padding:'1px 6px', color:'var(--adapt)', borderColor:'var(--adapt)', background:'var(--adapt-soft)' }}>custom</span>}
                 {t.source === 'custom' && t.balance_stale === true && !t._consolidated_zero && <span className="tv-chip warn"
                   title={ctBalanceStaleTitle(t.balance_as_of)}
@@ -1557,6 +1615,12 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, displayPrefs, o
                 {t.source === 'taostats' && t.tao_stale && <span className="tv-chip warn"
                   title={'Taostats data as of ' + (t.tao_as_of || 'unknown') + ' — counted at the last good read'}
                   style={{ fontSize:11, padding:'1px 6px' }}>stale</span>}
+                {t.source === 'hyperliquid' && t.hl_stale && <span className="tv-chip warn"
+                  title="The last Hyperliquid refresh failed for this wallet, so this is its last good read"
+                  style={{ fontSize:11, padding:'1px 6px' }}>stale</span>}
+                {t.source === 'hyperliquid' && t._unpriced && <span className="tv-chip warn"
+                  title="Hyperliquid has no USDC price for this coin, so it has no value here or in the total"
+                  style={{ fontSize:11, padding:'1px 6px' }}>no price</span>}
               </td>
               <td><ChainBadge chain={t.chain} /></td>
               <td className="num">{t._loading ? '…' : (t.balance == null ? '—' : mvn(t.balance,4,hideValues))}</td>
@@ -1565,7 +1629,7 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, displayPrefs, o
               <td style={{ display:'flex', alignItems:'center', gap:6 }}>
                 {t._consolidated_zero
                   ? <span style={{ fontSize:10, padding:'1px 6px', borderRadius:4, border:'1px solid var(--line)', color:'var(--text4)', whiteSpace:'nowrap' }}>no balance</span>
-                  : <WalletBadge label={t.wallet_label} />}
+                  : <WalletBadge label={t.source === 'hyperliquid' ? t.venue_label : t.wallet_label} />}
                 {t.source === 'custom' && t.custom_token_id != null && <button title="Remove custom token"
                   onClick={() => removeCustom(t.custom_token_id)} disabled={removedIds.has(t.custom_token_id)}
                   style={{ background:'none', border:'none', color:'var(--text4)', cursor:'pointer', fontSize:15, lineHeight:1, padding:'0 2px' }}
@@ -1841,6 +1905,10 @@ function LPTools() {
 
 function PortfolioScreen({ hideValues, portfolioSubTab, refreshTrigger, setActiveTab }) {
   const [portfolio, setPortfolio] = useState(null);
+  // Hyperliquid spot balances for Token Holdings (Landing 85): their own cache-only
+  // request, kept apart from portfolio so they can never reach the totals.
+  const [hlSpot, setHlSpot] = useState(null);
+  const [hlTries, setHlTries] = useState(0);
   const [wallets, setWallets] = useState([]);
   const [manualPositions, setManualPositions] = useState([]);
   const [config, setConfig] = useState({});
@@ -1867,16 +1935,32 @@ function PortfolioScreen({ hideValues, portfolioSubTab, refreshTrigger, setActiv
       // Display prefs (dust/lending thresholds). A prefs failure must never
       // break the portfolio load — degrade to {} and the defaults apply.
       api('/api/settings/display').catch(() => ({})),
-    ]).then(([pf, wl, cfg, prefs]) => {
+      // Hyperliquid balances (display only): a failure here never breaks the page.
+      api('/api/portfolio/hyperliquid-spot').catch(() => null),
+    ]).then(([pf, wl, cfg, prefs, hl]) => {
       setPortfolio(pf);
       setWallets(wl.wallets || []);
       setConfig(cfg || {});
       setDisplayPrefs(prefs || {});
+      setHlSpot(hl || null);
+      setHlTries(0);
     }).catch(() => {}).finally(() => { if (!background) setLoading(false); });
     loadManual();
   }, [loadManual]);
 
   useEffect(() => { loadPortfolio(); }, [refreshTrigger]);
+
+  // The first Hyperliquid read after a restart takes a moment: ask again every
+  // 6 s while the route answers "loading", at most 8 times.
+  useEffect(() => {
+    if (!hlSpot || hlSpot.status !== 'loading' || hlTries >= 8) return undefined;
+    const timer = setTimeout(() => {
+      setHlTries(n => n + 1);
+      // A slow answer never turns an "ok" already shown back into "loading".
+      api('/api/portfolio/hyperliquid-spot').then(d => { if (d) setHlSpot(prev => (prev && prev.status === 'ok' && d.status !== 'ok') ? prev : d); }).catch(() => {});
+    }, 6000);
+    return () => clearTimeout(timer);
+  }, [hlSpot, hlTries]);
 
   const activeTab = portfolioSubTab || 'tokens';
 
@@ -1889,7 +1973,7 @@ function PortfolioScreen({ hideValues, portfolioSubTab, refreshTrigger, setActiv
 
   return <ErrorBoundary>
     {activeTab === 'spot' && renderSpotTab()}
-    {activeTab === 'tokens' && <TokenHoldings portfolio={portfolio} wallets={wallets} hideValues={hideValues} config={config} displayPrefs={displayPrefs} onRefresh={() => loadPortfolio({ background: true })} />}
+    {activeTab === 'tokens' && <TokenHoldings portfolio={portfolio} wallets={wallets} hideValues={hideValues} config={config} displayPrefs={displayPrefs} hlSpot={hlSpot && hlSpot.status === 'loading' && hlTries >= 8 ? { ...hlSpot, gave_up: true } : hlSpot} onRefresh={() => loadPortfolio({ background: true })} />}
     {activeTab === 'lp' && <LPPositionsTab portfolio={portfolio} manualPositions={manualPositions} hideValues={hideValues} onRefetchManual={loadManual} />}
     {activeTab === 'lptools' && <LPTools />}
     {activeTab === 'borrow' && <BorrowLendTab portfolio={portfolio} hideValues={hideValues} displayPrefs={displayPrefs} onRefetch={loadPortfolio} />}
