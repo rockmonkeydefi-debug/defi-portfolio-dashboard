@@ -119,7 +119,8 @@ def test_hide_values_hides_the_summary_and_the_notes():
 
 def test_delete_is_one_request_to_one_route_after_a_confirmation_with_real_counts():
     assert JS.count("'DELETE'") == 1 and "wlRequest('DELETE', '/api/watchlist/' + key," in JS
-    assert "keepIds && keepIds.length ? { keep_image_ids: keepIds } : undefined" in JS
+    assert "if (keepIds && keepIds.length) body.keep_image_ids = keepIds;" in JS and "if (stamp) body.stamp = stamp;" in JS   # Landing 87: the stamp joins the keep list
+    assert "Object.keys(body).length ? body : undefined" in JS
     sec = _between(JS, "function WlTokenSection(", NL + "}" + NL)
     assert "const previewPath = '/api/watchlist/' + item.key + '/delete-preview';" in sec
     assert "wlRequest('GET', previewPath)" in sec                    # the usage line
@@ -143,7 +144,7 @@ def test_a_failed_preview_never_leaves_a_way_to_delete():
 
 
 def test_after_a_delete_the_page_drops_every_trace_and_refreshes_the_meter():
-    fn = _between(JS, "async function deleteItem(key, keepIds) {", NL + "  }" + NL)
+    fn = _between(JS, "async function deleteItem(key, keepIds, stamp) {", NL + "  }" + NL)
     assert "res.status === 404" in fn and "load();" in fn and "prev.data.items.filter(i => i.key !== key)" in fn
     assert "The server didn't confirm the delete. Reload the page to see whether it went through." in fn
     for needle in ("setExpandedFor(key, false);", "setDraftFor(key, undefined);", "setMeterKey(k => k + 1);",
@@ -227,7 +228,7 @@ def test_images_in_unsaved_drafts_elsewhere_are_kept():
     assert "/\\/api\\/note-images\\/([1-9][0-9]{0,9})/g" in fn and ".slice(0, 2000)" in fn
     assert "const pnDrafts = {};" in _read("static/pagenotes.js")
     sec = _between(JS, "function WlTokenSection(", NL + "}" + NL)
-    assert "const keepIds = wlDraftImageIds(item.key);" in sec and "await onDelete(confirm.keep)" in sec
+    assert "const keepIds = wlDraftImageIds(item.key);" in sec and "await onDelete(keepIds, stamp)" in sec
     assert "will stay because an unsaved note elsewhere in this browser uses" in sec
 
 
@@ -274,3 +275,72 @@ def test_the_chip_sits_between_the_name_and_the_price_and_the_intro_text_is_gone
     assert "Tokens you are watching but don't hold" not in JS
     top = _between(JS, '<div className="wl-top">', '<div className="wl-meter">')
     assert '<div className="tv-page-title">Watch List</div>' in top
+
+
+# -- delete protections (Landing 87): the Notes tab delete's guards (Landing 83), for a Watch List token ------------
+
+
+def _token_section():
+    return _between(JS, "function WlTokenSection(", NL + "}" + NL)
+
+
+def _do_delete():
+    return _between(_token_section(), "async function doDelete() {", NL + "  }" + NL)
+
+
+def _delete_item():
+    return _between(JS, "async function deleteItem(key, keepIds, stamp) {", NL + "  }" + NL)
+
+
+def test_the_delete_reads_the_drafts_again_at_the_click_and_waits_for_uploads():
+    up = _between(JS, "function wlUploadsBusy() {", NL + "}" + NL)
+    assert "typeof pnUploads === 'undefined'" in up and "typeof pnUploadCount !== 'function'" in up
+    assert "Object.keys(pnUploads).some(p => pnUploadCount(p) > 0)" in up
+    pagenotes = _read("static/pagenotes.js")
+    assert "const pnUploads = {};" in pagenotes and "function pnUploadCount(page) {" in pagenotes
+    do = _do_delete()
+    guard = do.index("if (wlUploadsBusy()) {")
+    reread = do.index("const keepIds = wlDraftImageIds(item.key);")
+    deleting = do.index("step: 'deleting'")
+    assert do.index("if (confirm.step !== 'ready') return;") < guard < reread < deleting      # the guard and the read come first
+    assert "return;" in do[guard:reread]                                                      # a busy upload stops the delete
+    assert "An image is still uploading into a note. Wait for it to finish, then delete." in do
+    assert "confirm.keep" not in do                                                           # not the list from when the question opened
+
+
+def test_the_stamp_goes_with_the_delete_and_a_409_changed_shows_the_counts_again():
+    do = _do_delete()
+    assert "const stamp = confirm.data ? confirm.data.stamp : undefined;" in do and "await onDelete(keepIds, stamp)" in do
+    assert "if (r && r.changed) {" in do and "loadQuestion('Not deleted: the token changed after this question opened" in do
+    sec = _token_section()
+    assert "function startConfirm() { return loadQuestion(''); }" in sec and "onClick={startConfirm}" in sec
+    assert "async function loadQuestion(note) {" in sec and "error: note || ''" in sec
+    load_q = _between(sec, "async function loadQuestion(note) {", NL + "  }" + NL)
+    assert "setUsage({ status: 'ok', data: res.data });" in load_q                           # the usage line follows the new counts
+    assert "onDelete={(keepIds, stamp) => deleteItem(item.key, keepIds, stamp)}" in JS
+    fn = _delete_item()
+    assert "res.status === 409 && res.data && res.data.changed === true" in fn and "return { ok: false, changed: true };" in fn
+    assert "showFlash((it ? it.name : 'The token') + ' changed after the question opened, so it was not deleted." in fn   # survives a remount
+    assert fn.index("changed: true") < fn.index("deletedRef.current[key] = true;")          # a refused delete never drops the row
+    assert "await" not in fn.split("changed: true", 1)[1].split("deletedRef.current[key] = true;", 1)[0]
+
+
+def test_clicks_made_while_the_delete_runs_win():
+    fn = _delete_item()
+    # the row's own controls wait for the answer
+    assert "const [deleting, setDeleting] = useWLState({});" in JS              # a map: two deletes can be on their way at once
+    assert "setDeleting(d => ({ ...d, [key]: true }));" in fn and "delete n[key]; return n; });" in fn
+    assert "busy={!!busy[item.key] || !!deleting[item.key]}" in JS
+    # the reply takes the list only when no other reply changed it meanwhile; otherwise only this token leaves it
+    assert "const seen = mutationsRef.current;" in fn
+    assert "if (res.status === 200 && mutationsRef.current === seen) applyList(res);" in fn
+    assert "prev.data.items.filter(i => i.key !== key)" in fn and "load();" in fn
+    # a late, older reply can't bring the token back
+    ap = _between(JS, "function applyList(res) {", NL + "  }" + NL)
+    assert "const gone = deletedRef.current;" in ap and "items.filter(i => !gone[i.key])" in ap
+    assert "res.data.items.some(i => gone[i.key])" in ap                                    # only a list that has one is rebuilt
+    assert "const deletedRef = useWLRef({});" in JS and "deletedRef.current[key] = true;" in fn
+    # the focus: read before the row leaves, moved only from the deleted row or from nowhere, not if something took it since
+    assert "const moveFocus = !at || at === document.body || !!(row && row.contains(at));" in fn
+    assert fn.index("const moveFocus") < fn.index("deletedRef.current[key] = true;")
+    assert "if (moveFocus) setTimeout(() => {" in fn and "if (now && now !== document.body) return;" in fn
