@@ -14810,6 +14810,10 @@ def api_page_notes_put(page):
                     "SELECT 1 FROM watch_items WHERE item_key = ? LIMIT 1", (page,)).fetchone() is None:
                 conn.rollback()
                 return jsonify({'error': 'unknown page'}), 404
+            # Landing 83: so has a Notes tab deleted since then.
+            if (page in _NOTE_TAB_DEFAULT_KEYS or _NOTE_TAB_NEW_RE.fullmatch(page)) and not _note_tab_live(conn, page):
+                conn.rollback()
+                return jsonify({'error': 'unknown page'}), 404
             # Landing 32: every image the note points to must be stored. Landing 79: checked inside the
             # transaction, because deleting a Watch List item can remove images.
             if image_ids:
@@ -14848,13 +14852,17 @@ def api_page_notes_put(page):
 # archived); the latest row per tab_key is the tab's current state, and a
 # default tab without a row has its default state. A tab's note is the
 # page_notes note whose page is the tab's key, so a tab change never touches
-# a note. Nothing is deleted: an archived tab leaves the tab bar and can be
-# restored with its note and every saved version. Added tabs get the keys
-# notes-t1, notes-t2, ..., never reused.
+# a note. An archived tab leaves the tab bar and can be restored with its
+# note and every saved version. Landing 83: a deleted tab (Watchlist and
+# Nuggets included) is gone for good: a row with deleted = 1 marks it, and its
+# notes, every saved version and the stored images no other note uses are
+# removed (api_note_tabs_delete). Added tabs get the keys notes-t1,
+# notes-t2, ..., never reused (deleted tabs' keys included).
 NOTE_TAB_DEFAULTS = (("notes-watchlist", "Watchlist"), ("notes-nuggets", "Nuggets"))
+_NOTE_TAB_DEFAULT_KEYS = tuple(k for k, _ in NOTE_TAB_DEFAULTS)
 NOTE_TAB_LABEL_MAX = 40         # characters, after trimming and collapsing runs of spaces
 NOTE_TABS_ACTIVE_MAX = 20       # tabs on the tab bar (archived tabs not counted)
-NOTE_TABS_TOTAL_MAX = 200       # tabs ever added on the page, archived ones included
+NOTE_TABS_TOTAL_MAX = 200       # added tabs kept on the page, archived ones included (deleted ones not: Landing 83)
 _NOTE_TAB_NEW_RE = re.compile(r"notes-t([1-9][0-9]{0,5})")
 # Control characters, lone surrogates (not storable as UTF-8), and the marks
 # that reverse or isolate the direction of text (they would make a tab name
@@ -14862,26 +14870,38 @@ _NOTE_TAB_NEW_RE = re.compile(r"notes-t([1-9][0-9]{0,5})")
 _NOTE_TAB_LABEL_BAD_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 
 
+def _note_tab_live(conn, key):
+    """Landing 83: True when `key` is a Notes tab that exists and is not deleted - a default tab without a row,
+    or a tab whose latest note_tabs row has deleted = 0 (archived tabs included)."""
+    r = conn.execute("SELECT deleted FROM note_tabs WHERE tab_key = ? ORDER BY id DESC LIMIT 1", (key,)).fetchone()
+    if r is None:
+        return key in _NOTE_TAB_DEFAULT_KEYS
+    return not r[0]
+
+
 def _page_note_page_known(page):
     """True for a page the notes routes serve: PAGE_NOTE_PAGES (the Spot note
     and the default Notes tabs), or a tab added on the Notes page - archived
     ones included, whose notes stay readable and savable; or (Landing 78) a
-    Watch List item's key (notes-w<n>, a row in watch_items). Reads note_tabs
-    or watch_items only for a name shaped like such a key."""
-    if page in PAGE_NOTE_PAGES:
-        return True
+    Watch List item's key (notes-w<n>, a row in watch_items). Landing 83: a
+    deleted Notes tab, a default one included, is unknown (_note_tab_live).
+    Reads note_tabs or watch_items only for a Notes tab's key or a name
+    shaped like such a key."""
     if not isinstance(page, str):
         return False
-    if _NOTE_TAB_NEW_RE.fullmatch(page):
-        sql = "SELECT 1 FROM note_tabs WHERE tab_key = ? LIMIT 1"
+    if page in _NOTE_TAB_DEFAULT_KEYS or _NOTE_TAB_NEW_RE.fullmatch(page):
+        check = lambda conn: _note_tab_live(conn, page)
+    elif page in PAGE_NOTE_PAGES:
+        return True
     elif _WATCH_KEY_RE.fullmatch(page):
-        sql = "SELECT 1 FROM watch_items WHERE item_key = ? LIMIT 1"
+        check = lambda conn: conn.execute(
+            "SELECT 1 FROM watch_items WHERE item_key = ? LIMIT 1", (page,)).fetchone() is not None
     else:
         return False
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
     try:
-        return conn.execute(sql, (page,)).fetchone() is not None
+        return check(conn)
     finally:
         conn.close()
 
@@ -14920,21 +14940,26 @@ def _note_tab_label(raw):
     return label, None
 
 
-def _note_tabs_all(conn):
+def _note_tabs_all(conn, with_deleted=False):
     """Every Notes tab, archived ones included: {key: {key, label, position,
-    archived, default, first_id, changed_at}}. A default tab without a row
+    archived, deleted, default, first_id, changed_at}}. A default tab without a row
     has its default state; first_id (the tab's first row, below every
-    stored id for a default tab) breaks ties in the order."""
+    stored id for a default tab) breaks ties in the order. Landing 83: a
+    deleted tab is left out unless with_deleted (for the next key: a
+    deleted tab's key is never used again)."""
     n = len(NOTE_TAB_DEFAULTS)
-    tabs = {key: {"key": key, "label": label, "position": i, "archived": False, "default": True,
+    tabs = {key: {"key": key, "label": label, "position": i, "archived": False, "deleted": False, "default": True,
                   "first_id": i - n, "changed_at": None}
             for i, (key, label) in enumerate(NOTE_TAB_DEFAULTS)}
-    for r in conn.execute("SELECT id, tab_key, label, position, archived, created_at FROM note_tabs ORDER BY id"):
+    for r in conn.execute("SELECT id, tab_key, label, position, archived, deleted, created_at FROM note_tabs ORDER BY id"):
         t = tabs.get(r["tab_key"])
         if t is None:
             t = tabs[r["tab_key"]] = {"key": r["tab_key"], "default": False, "first_id": r["id"]}
-        t.update(label=r["label"], position=r["position"], archived=bool(r["archived"]), changed_at=r["created_at"])
-    return tabs
+        t.update(label=r["label"], position=r["position"], archived=bool(r["archived"]), deleted=bool(r["deleted"]),
+                 changed_at=r["created_at"])
+    if with_deleted:
+        return tabs
+    return {k: t for k, t in tabs.items() if not t["deleted"]}
 
 
 def _note_tabs_ordered(tabs):
@@ -14956,8 +14981,9 @@ def _note_tabs_view(conn):
 
 
 def _note_tab_write(conn, tab, now):
-    conn.execute("INSERT INTO note_tabs (tab_key, label, position, archived, created_at) VALUES (?, ?, ?, ?, ?)",
-                 (tab["key"], tab["label"], tab["position"], 1 if tab["archived"] else 0, now))
+    conn.execute("INSERT INTO note_tabs (tab_key, label, position, archived, deleted, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                 (tab["key"], tab["label"], tab["position"], 1 if tab["archived"] else 0,
+                  1 if tab.get("deleted") else 0, now))
 
 
 def _note_tab_label_taken(active, label, except_key=None):
@@ -15002,7 +15028,8 @@ def api_note_tabs_add():
         conn = get_connection()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            tabs = _note_tabs_all(conn)
+            every = _note_tabs_all(conn, with_deleted=True)
+            tabs = {k: t for k, t in every.items() if not t["deleted"]}
             active, _ = _note_tabs_ordered(tabs)
             taken = _note_tab_label_taken(active, label)
             if taken is not None:
@@ -15016,9 +15043,9 @@ def api_note_tabs_add():
                                          f'archive one before adding another', **_note_tabs_view(conn)}), 409
             if sum(1 for t in tabs.values() if not t["default"]) >= NOTE_TABS_TOTAL_MAX:
                 conn.rollback()
-                return jsonify({'error': f'at most {NOTE_TABS_TOTAL_MAX} tabs can be added; '
-                                         f'restore an archived tab instead', **_note_tabs_view(conn)}), 409
-            nums = [int(m.group(1)) for m in (_NOTE_TAB_NEW_RE.fullmatch(k) for k in tabs) if m]
+                return jsonify({'error': f'at most {NOTE_TABS_TOTAL_MAX} added tabs can be kept, archived ones '
+                                         f'included; delete an archived tab first', **_note_tabs_view(conn)}), 409
+            nums = [int(m.group(1)) for m in (_NOTE_TAB_NEW_RE.fullmatch(k) for k in every) if m]
             key = f"notes-t{max(nums, default=0) + 1}"
             position = max((t["position"] for t in active), default=-1) + 1
             _note_tab_write(conn, {"key": key, "label": label, "position": position, "archived": False}, _note_now())
@@ -15087,7 +15114,7 @@ def api_note_tabs_change(key):
     """Rename, archive or restore a tab. Body: {"label": new name} and / or
     {"archived": true | false}.
 
-    404 for an unknown tab; 400 for a bad body or name, or (with the current
+    404 for an unknown tab (a deleted one included, Landing 83); 400 for a bad body or name, or (with the current
     tabs) a new name another open tab already has, ignoring case, when the
     tab is open after the change (a change of case alone is fine);
     409 with the current tabs when archiving the last open tab, or restoring
@@ -15191,7 +15218,8 @@ def api_note_tabs_copy(key):
         conn = get_connection()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            tabs = _note_tabs_all(conn)
+            every = _note_tabs_all(conn, with_deleted=True)
+            tabs = {k: t for k, t in every.items() if not t["deleted"]}
             src = tabs.get(key)
             if src is None:
                 conn.rollback()
@@ -15203,14 +15231,14 @@ def api_note_tabs_copy(key):
                                          f'archive one before copying another', **_note_tabs_view(conn)}), 409
             if sum(1 for t in tabs.values() if not t["default"]) >= NOTE_TABS_TOTAL_MAX:
                 conn.rollback()
-                return jsonify({'error': f'at most {NOTE_TABS_TOTAL_MAX} tabs can be added; '
-                                         f'restore an archived tab instead', **_note_tabs_view(conn)}), 409
+                return jsonify({'error': f'at most {NOTE_TABS_TOTAL_MAX} added tabs can be kept, archived ones '
+                                         f'included; delete an archived tab first', **_note_tabs_view(conn)}), 409
             label = _note_tab_copy_label(src["label"], active)
             if label is None:
                 conn.rollback()
                 return jsonify({'error': 'no free name for the copy; rename a copy first',
                                 **_note_tabs_view(conn)}), 409
-            nums = [int(m.group(1)) for m in (_NOTE_TAB_NEW_RE.fullmatch(k) for k in tabs) if m]
+            nums = [int(m.group(1)) for m in (_NOTE_TAB_NEW_RE.fullmatch(k) for k in every) if m]
             new_key = f"notes-t{max(nums, default=0) + 1}"
             keys = [t["key"] for t in active]
             keys.insert(keys.index(key) + 1 if key in keys else len(keys), new_key)
@@ -15236,6 +15264,114 @@ def api_note_tabs_copy(key):
     except Exception:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': "The tab couldn't be copied. Nothing was changed."}), 500
+
+
+# Landing 83 (Nov 1, Glenn "1 B / 2 A / 3 A"): delete a Notes tab for good, from Tab options or the Archived list.
+# Any tab can be deleted (Watchlist and Nuggets included) except the last open one. What it removes is worked out
+# as for a Watch List item (_watch_delete_plan reads every page's notes, so an image a copied tab or any other note
+# also uses stays); the browser sends the image ids in its unsaved drafts on other pages (keep_image_ids).
+def _note_tab_delete_stamp(conn, key):
+    """What a delete question was based on: the tab's latest note version and its latest note_tabs row (0 when
+    none). A delete sent with another stamp is refused (409), so it never removes a version or change made after
+    the question showed its counts."""
+    note = conn.execute("SELECT MAX(id) FROM page_notes WHERE page = ?", (key,)).fetchone()[0] or 0
+    tab = conn.execute("SELECT MAX(id) FROM note_tabs WHERE tab_key = ?", (key,)).fetchone()[0] or 0
+    return f"{note}:{tab}"
+
+
+@app.route('/api/note-tabs/<key>/delete-preview', methods=['GET'])
+def api_note_tabs_delete_preview(key):
+    """What deleting the tab would remove: {"key", "label", "archived", "last_open" (true for the only open tab,
+    which can't be deleted), "note_versions", "images": {count, bytes} (its notes use, every saved version),
+    "frees": {count, bytes} (a delete removes), "kept_for_drafts": {count, bytes} (kept because the query's keep
+    list - ids an unsaved note elsewhere uses, comma-separated - names them), "stamp" (_note_tab_delete_stamp, for
+    the delete)}. Read-only. 404 for an unknown or deleted tab; 400 for a bad keep list."""
+    raw = (request.args.get('keep') or '').strip()
+    keep, err = _watch_keep_ids([int(x) if x.isdigit() and len(x) <= 10 else -1 for x in raw.split(',')] if raw else None)
+    if err:
+        return jsonify({'error': err}), 400
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            tabs = _note_tabs_all(conn)
+            tab = tabs.get(key)
+            if tab is None:
+                return jsonify({'error': 'unknown tab'}), 404
+            active, _ = _note_tabs_ordered(tabs)
+            plan = _watch_delete_plan(conn, key, keep)
+            stamp = _note_tab_delete_stamp(conn, key)
+        finally:
+            conn.close()
+        return jsonify({"key": key, "label": tab["label"], "archived": tab["archived"],
+                        "last_open": not tab["archived"] and len(active) <= 1, "note_versions": plan["versions"],
+                        "images": plan["images"], "frees": plan["frees"], "kept_for_drafts": plan["kept_for_drafts"],
+                        "stamp": stamp})
+    except Exception:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': "Couldn't read what deleting the tab would remove."}), 500
+
+
+@app.route('/api/note-tabs/<key>', methods=['DELETE'])
+def api_note_tabs_delete(key):
+    """Delete a tab for good, in one transaction: a row with deleted = 1 (the key is never used again), every
+    saved version of its note (page_notes) and the stored images no note on any other page refers to. Nothing else
+    is touched; the other tabs keep their places. An optional body {"keep_image_ids": [...], "stamp": ...}:
+    keep_image_ids names images an unsaved note elsewhere uses (the page sends the ids in this browser's note
+    drafts), and those stay; stamp is the delete-preview's, and when the tab's notes or state changed since then
+    (a save from another device, a rename) nothing is deleted: 409 with "changed": true and the current tabs, so
+    the question can show the new counts. 404 for an unknown tab (a deleted one included); 400 for a bad body;
+    409 with the current tabs for the last open tab. Anything that fails midway changes nothing. Returns
+    _note_tabs_view plus "deleted" (the key), "label", "note_versions", "freed" ({count, bytes}),
+    "kept_for_drafts" and "usage" (the note image storage now, as /api/note-images/usage)."""
+    data = request.get_json(silent=True) if request.get_data() else None
+    if request.get_data() and (not isinstance(data, dict) or not set(data) <= {"keep_image_ids", "stamp"}):
+        return jsonify({'error': 'the body must be empty or {"keep_image_ids": [...], "stamp": ...}'}), 400
+    keep, err = _watch_keep_ids((data or {}).get("keep_image_ids"))
+    if err:
+        return jsonify({'error': err}), 400
+    stamp = (data or {}).get("stamp")
+    if stamp is not None and (not isinstance(stamp, str) or not re.fullmatch(r"[0-9]{1,19}:[0-9]{1,19}", stamp)):
+        return jsonify({'error': 'stamp must be the one the delete preview gave'}), 400
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            tabs = _note_tabs_all(conn)
+            tab = tabs.get(key)
+            if tab is None:
+                conn.rollback()
+                return jsonify({'error': 'unknown tab'}), 404
+            active, _ = _note_tabs_ordered(tabs)
+            if not tab["archived"] and len(active) <= 1:
+                conn.rollback()
+                return jsonify({'error': "the last open tab can't be deleted; add another tab first",
+                                **_note_tabs_view(conn)}), 409
+            if stamp is not None and stamp != _note_tab_delete_stamp(conn, key):
+                conn.rollback()
+                return jsonify({'error': 'the tab changed after the question opened (a save or a change in another '
+                                         'window); check the counts again', 'changed': True, **_note_tabs_view(conn)}), 409
+            plan = _watch_delete_plan(conn, key, keep)
+            _note_tab_write(conn, {**tab, "deleted": True}, _note_now())
+            conn.execute("DELETE FROM page_notes WHERE page = ?", (key,))
+            free = plan["free_ids"]
+            for i in range(0, len(free), 500):
+                part = free[i:i + 500]
+                conn.execute(f"DELETE FROM note_images WHERE id IN ({','.join('?' * len(part))})", part)
+            usage = _note_images_usage(conn)
+            view = _note_tabs_view(conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return jsonify({**view, "deleted": key, "label": tab["label"], "note_versions": plan["versions"],
+                        "freed": plan["frees"], "kept_for_drafts": plan["kept_for_drafts"], "usage": usage})
+    except Exception:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': "The tab couldn't be deleted. Nothing was changed."}), 500
 
 
 # ── Images in notes (Landing 32) ────────────────────────────────────────────
