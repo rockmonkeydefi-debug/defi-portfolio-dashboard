@@ -173,7 +173,7 @@ def test_the_notes_page_is_as_wide_as_spot_without_the_maxfi_rules():
 def test_copy_tab_is_in_tab_options_and_calls_its_route():
     src = _read("static/notebook.js")
     assert ("/api/note-tabs/<key>/copy", "POST") in _routes()
-    assert "const NB_TAB_MODES = ['options', 'rename', 'archive', 'copy'];" in src
+    assert "const NB_TAB_MODES = ['options', 'rename', 'archive', 'copy', 'delete'];" in src   # delete: Landing 83
     options = src.split("if (box.mode === 'options') {", 1)[1].split("if (box.mode === 'archive') {", 1)[0]
     assert "onClick={() => copyTab(false)}" in options and ">Copy tab</button>" in options
     assert "disabled={full || busy}" in options
@@ -195,3 +195,97 @@ def test_the_copy_word_and_limits_match_the_name_rules():
     assert wp.NOTE_TAB_COPY_WORD == "copy"
     assert wp._note_tab_copy_label("Setups", []) == "Setups (copy)"
     assert len(wp._note_tab_copy_label("y" * 40, [])) == wp.NOTE_TAB_LABEL_MAX
+
+
+# -- Delete a tab (Landing 83) ------------------------------------------------------------
+
+def _fn(src, head):
+    return src.split(head, 1)[1].split("\n  }\n", 1)[0]
+
+
+def test_delete_routes_exist_and_the_keep_limit_matches():
+    src = _read("static/notebook.js")
+    assert ("/api/note-tabs/<key>", "DELETE") in _routes() and ("/api/note-tabs/<key>/delete-preview", "GET") in _routes()
+    assert "const NB_KEEP_IDS_MAX = %d;" % wp.WATCH_KEEP_IDS_MAX in src
+    assert "const NB_DELETE_ARCHIVED = 'delete-archived';" in src
+
+
+def test_delete_is_in_tab_options_after_archive():
+    src = _read("static/notebook.js")
+    options = src.split("if (box.mode === 'options') {", 1)[1].split("if (box.mode === 'archive') {", 1)[0]
+    assert "onClick={() => startDelete(current, 'delete')}>{'Delete\\u2026'}</button>" in options
+    assert options.index("Archive") < options.index("startDelete(current, 'delete')") < options.index(">Close</button>")
+
+
+def test_each_archived_tab_has_delete_next_to_restore():
+    src = _read("static/notebook.js")
+    arch = src.split("if (box.mode === 'archived') {", 1)[1].split("return null;", 1)[0]
+    assert "aria-label={'Delete the ' + t.label + ' tab'}" in arch
+    assert "onClick={() => startDelete(t, NB_DELETE_ARCHIVED)}>{'Delete\\u2026'}</button>" in arch
+    assert arch.index("restoreTab(t)") < arch.index("startDelete(t, NB_DELETE_ARCHIVED)")
+    assert "{box.info && <div role=\"status\" className=\"nb-box-text\">{box.info}</div>}" in arch
+    assert "aria-expanded={boxFor(['archived', NB_DELETE_ARCHIVED])}" in src
+
+
+def test_the_question_reads_exact_counts_and_keeps_draft_images():
+    src = _read("static/notebook.js")
+    assert "function startDelete(t, mode) {\n    if (busy) return;\n    loadDelete(t, mode, '');\n  }" in src
+    fn = _fn(src, "async function loadDelete(t, mode, note) {")
+    assert "const keep = nbDraftImageIds(t.page);" in fn
+    assert "'/api/note-tabs/' + encodeURIComponent(t.page) + '/delete-preview'" in fn and "'?keep=' + keep.join(',')" in fn
+    assert "step: 'error', gone: res.status === 404" in fn and "if (res.status === 404) load();" in fn
+    ids = src.split("function nbDraftImageIds(exceptPage) {", 1)[1].split("\n}\n", 1)[0]
+    assert "if (page === exceptPage" in ids and "/\\/api\\/note-images\\/([1-9][0-9]{0,9})/g" in ids
+    assert wp._PAGE_NOTE_IMAGE_SRC_RE.pattern == r"/api/note-images/([1-9][0-9]{0,9})"
+    assert ".slice(0, NB_KEEP_IDS_MAX)" in ids
+    up = src.split("function nbUploadsBusy() {", 1)[1].split("\n}\n", 1)[0]
+    assert "Object.keys(pnUploads).some(p => pnUploadCount(p) > 0)" in up
+
+
+def test_delete_sends_the_keep_list_and_stamp_and_handles_every_reply():
+    src = _read("static/notebook.js")
+    fn = _fn(src, "async function deleteTab() {")
+    assert "if (busy || del.step !== 'ready' || !del.data || del.data.last_open) return;" in fn
+    assert "if (nbUploadsBusy()) {" in fn and "An image is still uploading into a note." in fn
+    assert "const keep = nbDraftImageIds(key);" in fn                                 # read again at the click
+    assert "nbRequest('DELETE', '/api/note-tabs/' + encodeURIComponent(key), { keep_image_ids: keep, stamp: del.data.stamp })" in fn
+    assert "if (res.status === 409 && res.data && res.data.changed) {" in fn and "loadDelete(t, live.box.mode, 'Not deleted: the tab changed" in fn
+    assert "if (!ok && res.status !== 404) {" in fn                                    # 404: deleted elsewhere = gone
+    assert "\"The server didn't confirm the delete. Reload the page to see whether it went through.\"" in fn
+    assert "delete pnDrafts[key];" in fn
+    assert "'Freed ' + nbPlural(f.count, 'image') + ' (' + nbMb(f.bytes) + ').'" in fn and "'No images were freed.'" in fn
+    # Clicks made while the delete ran win: the page moves on only from what it shows now.
+    assert "const live = liveRef.current;" in fn
+    assert "live.box.target === key" in fn and "if (live.page === key && next) show(next.page);" in fn
+    assert "if (asking && fromArchived && left > 0) { setBox({ mode: 'archived', text: '', page: null, info: msg }); return; }" in fn
+    assert "if (!asking) return;" in fn
+    assert "liveRef.current = { page: current ? current.page : null, box };" in src
+
+
+def test_another_windows_delete_refreshes_the_list_on_any_change():
+    src = _read("static/notebook.js")
+    fn = _fn(src, "async function write(method, path, body) {")
+    assert "if (res.status === 404) load();" in fn
+
+
+def test_the_question_says_what_goes_and_keep_comes_first():
+    src = _read("static/notebook.js")
+    body = src.split("function deleteBody() {", 1)[1].split("\n  }\n", 1)[0]
+    assert '<div role="alertdialog" aria-labelledby={titleId}' in body
+    assert "'Delete the \\u201c' + t.label + '\\u201d tab permanently?'" in body
+    assert "\" This can't be undone. For a copy first, use Settings, Export DB.\"" in body
+    assert "' Your unsaved edits on this tab will be lost too.'" in body
+    assert '<div role="alert" className="pn-alert">This is the only open tab. Add another tab before deleting it.</div>' in body
+    assert '<div aria-live="polite">' in body and 'id={descId}>{text}</p>' in body
+    assert "{del.gone\n          ? <button type=\"button\" className=\"tv-btn pn-btn\" data-nb-first=\"\" onClick={keepTab}>Close</button>" in body
+    assert "labelsRef.current[del.key]" in body
+    assert "disabled={!d || working || d.last_open || busy}" in body
+    assert "data-nb-first={del.step === 'error' ? undefined : ''}" in body and "onClick={keepTab}>Keep</button>" in body
+    assert "if (box.mode === 'delete' || box.mode === NB_DELETE_ARCHIVED) { if (del.step !== 'deleting') keepTab(); }" in src
+    assert "if (box.mode === 'delete' || box.mode === NB_DELETE_ARCHIVED) return deleteBody();" in src
+
+
+def test_a_tab_deleted_in_another_window_is_named_when_its_panel_closes():
+    src = _read("static/notebook.js")
+    assert "tabs.forEach(t => { labelsRef.current[t.page] = t.label; });" in src
+    assert ": !gone && name ? '\\u201c' + name + '\\u201d was deleted, maybe in another window.' : ''" in src
