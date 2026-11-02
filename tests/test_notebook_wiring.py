@@ -113,7 +113,9 @@ def test_a_save_closes_only_the_draft_it_carried():
 
 def test_full_page_mode_only_changes_the_notes_page():
     src = _read("static/pagenotes.js")
-    assert "function PageNotesPanel({ page, hideValues, label, variant }) {" in src
+    # Landing 88 added the optional props io and emptyText (a Spot Summary's routes and empty text); a panel
+    # without them is the panel pinned here.
+    assert "function PageNotesPanel({ page, hideValues, label, variant, io, emptyText }) {" in src
     assert "const full = variant === 'page';" in src
     assert "const clamp = !full && !expanded && tall;" in src
     assert "{!full && (tall || expanded) && <button" in src

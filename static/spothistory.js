@@ -195,6 +195,7 @@ function SpotHistoryByTrade({ hideValues, refreshTrigger, bookFilter, setBookFil
   const [updatesByKey, setUpdatesByKey] = useSHXState({});
   const [notesError, setNotesError] = useSHXState(false);
   const [summaries, setSummaries] = useSHXState({});
+  const [summaryDocs, setSummaryDocs] = useSHXState({});      // Landing 88: position key -> the Summary's editor document (none for plain text)
   const [earlier, setEarlierState] = useSHXState(shxReadEarlier);
   const [openIds, setOpenIds] = useSHXState(() => new Set());
   const [fullJournal, setFullJournal] = useSHXState(() => new Set());
@@ -221,8 +222,13 @@ function SpotHistoryByTrade({ hideValues, refreshTrigger, bookFilter, setBookFil
     api('/api/spot/position-notes').then(list => {
       if (!alive || !Array.isArray(list)) return;
       const byKey = {};
-      for (const n of list) byKey[n.chain + ' ' + n.contract_address] = n.note || '';
+      const docs = {};
+      for (const n of list) {
+        byKey[n.chain + ' ' + n.contract_address] = n.note || '';
+        if (n.delta) docs[n.chain + ' ' + n.contract_address] = n.delta;
+      }
       setSummaries(byKey);
+      setSummaryDocs(docs);
     }).catch(() => {});
     return () => { alive = false; };
   }, [refreshTrigger]);
@@ -263,8 +269,9 @@ function SpotHistoryByTrade({ hideValues, refreshTrigger, bookFilter, setBookFil
   function onUpdatesChanged(key, fn) {
     setUpdatesByKey(prev => ({ ...prev, [key]: fn(prev[key] || []) }));
   }
-  function onSummarySaved(key, note) {
+  function onSummarySaved(key, note, delta) {
     setSummaries(prev => ({ ...prev, [key]: note }));
+    setSummaryDocs(prev => ({ ...prev, [key]: delta || undefined }));
   }
 
   const num = (label, content, style, title) => <div className="spot-cell tv-num" data-label={label} title={title}
@@ -355,13 +362,16 @@ function SpotHistoryByTrade({ hideValues, refreshTrigger, bookFilter, setBookFil
               {notesError && hasJournal && <div role="alert" style={{ color: 'var(--fail)', fontSize: 13 }}>Couldn't load the journal updates. Refresh to try again.</div>}
               {showFull && hasJournal
                 ? <SpotJournal row={{ position_key: key, symbol: t.symbol, note: summary }} updates={updatesByKey[key] || []}
+                    scope={'t' + id}
                     notesError={notesError} onSummarySaved={onSummarySaved} onUpdatesChanged={onUpdatesChanged}
                     draft={journal.drafts[key] || ''} onDraftChange={v => journal.setDrafts(prev => ({ ...prev, [key]: v }))}
                     composing={!!journal.composing[key]} setComposing={v => journal.setComposing(prev => ({ ...prev, [key]: v }))} />
                 : <React.Fragment>
                     {hasJournal && <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                       <span style={SHX_SECTION}>Summary</span>
-                      {summary.trim() ? <SJNoteText text={summary} />
+                      {summary.trim() ? (summaryDocs[key] && window.PageNotesRead
+                          ? <div className="pn-read pn-read-sj"><window.PageNotesRead delta={summaryDocs[key]} /></div>
+                          : <SJNoteText text={summary} />)
                         : <span style={{ fontSize: 13, color: 'var(--text3)' }}>No summary yet.</span>}
                     </div>}
                     {ups.map(u => {
