@@ -16166,12 +16166,25 @@ def _watch_delete_plan(conn, key, keep=frozenset()):
             "kept_for_drafts": _watch_image_stats(conn, unshared & set(keep))}
 
 
+# Landing 87 (Nov 2, Glenn "your recs"): the Watch List delete gets the same stamp as a Notes tab delete (L83). The
+# stamp is what a delete question was based on: the item's latest note version and its latest watch_items row (every
+# change to the item - priority, Active, summary - appends one, so any of them moves the stamp). A delete sent with
+# another stamp is refused (409) before anything is removed. Not in the stamp: the saved trend (watch_trend) and other
+# pages' notes; the delete works out the images to free inside its own transaction either way.
+def _watch_delete_stamp(conn, key):
+    """"<latest page_notes id for the item>:<latest watch_items id for the item>" (0 for a part with no rows)."""
+    note = conn.execute("SELECT MAX(id) FROM page_notes WHERE page = ?", (key,)).fetchone()[0] or 0
+    item = conn.execute("SELECT MAX(id) FROM watch_items WHERE item_key = ?", (key,)).fetchone()[0] or 0
+    return f"{note}:{item}"
+
+
 @app.route('/api/watchlist/<key>/delete-preview', methods=['GET'])
 def api_watchlist_delete_preview(key):
     """What deleting the item would remove (_watch_delete_plan): {"key", "name", "note_versions", "images": {count,
     bytes} (its notes use, every saved version), "frees": {count, bytes} (a delete removes), "kept_for_drafts":
     {count, bytes} (kept because the query's keep list - ids an unsaved note elsewhere uses, comma-separated -
-    names them). Read-only. 404 for an unknown key; 400 for a bad keep list."""
+    names them), "stamp" (_watch_delete_stamp, for the delete)}. Read-only. 404 for an unknown key; 400 for a bad
+    keep list."""
     if not _WATCH_KEY_RE.fullmatch(key):
         return jsonify({'error': 'unknown watch list item'}), 404
     raw = (request.args.get('keep') or '').strip()
@@ -16185,11 +16198,15 @@ def api_watchlist_delete_preview(key):
             it = _watch_items_all(conn).get(key)
             if it is None:
                 return jsonify({'error': 'unknown watch list item'}), 404
+            # The stamp is read BEFORE the counts: a change landing between the two reads then leaves the stamp older
+            # than the state, so the delete is refused (409) instead of passing with counts that are out of date.
+            stamp = _watch_delete_stamp(conn, key)
             plan = _watch_delete_plan(conn, key, keep)
         finally:
             conn.close()
         return jsonify({"key": key, "name": it["name"], "note_versions": plan["versions"],
-                        "images": plan["images"], "frees": plan["frees"], "kept_for_drafts": plan["kept_for_drafts"]})
+                        "images": plan["images"], "frees": plan["frees"], "kept_for_drafts": plan["kept_for_drafts"],
+                        "stamp": stamp})
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': str(e)}), 500
@@ -16201,18 +16218,23 @@ def api_watchlist_delete(key):
     saved version of its notes (page_notes) and the stored images no note on any other page refers to (an image
     another note also uses stays). Nothing else is touched, and the key is never handed out again. 404 for an
     unknown key (an item already deleted is unknown); anything that fails midway changes nothing. An optional
-    body {"keep_image_ids": [...]} names images an unsaved note elsewhere uses (the page sends the ids in this
-    browser's note drafts); those stay. 400 for a bad body. Returns _watch_view plus "deleted" (the key), "name",
-    "note_versions", "freed" ({count, bytes}), "kept_for_drafts" and "usage" (the note image storage now, as
-    /api/note-images/usage)."""
+    body {"keep_image_ids": [...], "stamp": ...} names images an unsaved note elsewhere uses (the page sends the
+    ids in this browser's note drafts); those stay. stamp is the delete-preview's (_watch_delete_stamp): when the
+    item's notes or list entry changed since then (a save or a change from another window or device) nothing is
+    deleted: 409 with "changed": true and the current list, so the question can show the new counts. 400 for a bad
+    body. Returns _watch_view plus "deleted" (the key), "name", "note_versions", "freed" ({count, bytes}),
+    "kept_for_drafts" and "usage" (the note image storage now, as /api/note-images/usage)."""
     if not _WATCH_KEY_RE.fullmatch(key):
         return jsonify({'error': 'unknown watch list item'}), 404
     data = request.get_json(silent=True) if request.get_data() else None
-    if request.get_data() and (not isinstance(data, dict) or not set(data) <= {"keep_image_ids"}):
-        return jsonify({'error': 'the body must be empty or {"keep_image_ids": [...]}'}), 400
+    if request.get_data() and (not isinstance(data, dict) or not set(data) <= {"keep_image_ids", "stamp"}):
+        return jsonify({'error': 'the body must be empty or {"keep_image_ids": [...], "stamp": ...}'}), 400
     keep, err = _watch_keep_ids((data or {}).get("keep_image_ids"))
     if err:
         return jsonify({'error': err}), 400
+    stamp = (data or {}).get("stamp")
+    if stamp is not None and (not isinstance(stamp, str) or not re.fullmatch(r"[0-9]{1,19}:[0-9]{1,19}", stamp)):
+        return jsonify({'error': 'stamp must be the one the delete preview gave'}), 400
     try:
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
@@ -16222,6 +16244,10 @@ def api_watchlist_delete(key):
             if it is None:
                 conn.rollback()
                 return jsonify({'error': 'unknown watch list item'}), 404
+            if stamp is not None and stamp != _watch_delete_stamp(conn, key):
+                conn.rollback()
+                return jsonify({'error': 'the token changed after the question opened (a save or a change in another '
+                                         'window); check the counts again', 'changed': True, **_watch_view(conn)}), 409
             plan = _watch_delete_plan(conn, key, keep)
             conn.execute("DELETE FROM page_notes WHERE page = ?", (key,))
             free = plan["free_ids"]

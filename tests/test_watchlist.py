@@ -13,6 +13,7 @@ web_portfolio spawns a background scheduler on non-__main__ import; we
 neutralize threading.Thread.start during import (established pattern).
 """
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -783,6 +784,163 @@ def test_a_bad_keep_query_is_refused(two, q):
 
 def test_an_empty_delete_body_still_works(two):
     assert two.delete(f"{WATCH}/notes-w1", json={}).status_code == 200
+
+
+# -- delete stamp (Landing 87) ----------------------------------------------------------
+# The preview says what its counts were based on; a delete sent with another stamp is refused (409) and removes
+# nothing, as for a Notes tab (Landing 83).
+
+
+def _preview(client, key="notes-w1", keep=""):
+    r = client.get(f"{WATCH}/{key}/delete-preview" + (f"?keep={keep}" if keep else ""))
+    assert r.status_code == 200
+    return r.get_json()
+
+
+def _tables(db):
+    """Everything a delete could touch, as comparable values."""
+    return (rows(db), [tuple(r) for r in db.execute("SELECT page, id FROM page_notes ORDER BY id")],
+            [tuple(r) for r in db.execute("SELECT item_key, computed_at FROM watch_trend ORDER BY item_key")],
+            _image_ids(db))
+
+
+def test_the_preview_carries_a_stamp_that_moves_with_the_items_notes(two, db):
+    s0 = _preview(two)["stamp"]
+    assert re.fullmatch(r"[0-9]+:[0-9]+", s0) and s0 == _preview(two)["stamp"]         # same until something changes
+    note, item = (int(x) for x in s0.split(":"))
+    assert note == 0 and item >= 1                                                    # no note yet; the item has a row
+    v1 = _save_note(two, "notes-w1", text="first")
+    s1 = _preview(two)["stamp"]
+    assert s1 != s0 and s1.split(":")[0] == str(v1)
+    _save_note(two, "notes-w1", text="second", base=v1)
+    assert _preview(two)["stamp"] not in (s0, s1)
+
+
+@pytest.mark.parametrize("body", [{"priority": "high"}, {"summary": "new plan"}, {"active": False}])
+def test_any_change_to_the_item_moves_the_stamp(two, body):
+    s0 = _preview(two)["stamp"]
+    assert two.put(f"{WATCH}/notes-w1", json=body).status_code == 200
+    assert _preview(two)["stamp"] != s0
+
+
+def test_activity_on_another_item_does_not_move_the_stamp(two, db):
+    s0 = _preview(two)["stamp"]
+    _save_note(two, "notes-w2", text="elsewhere")
+    assert two.put(f"{WATCH}/notes-w2", json={"priority": "low"}).status_code == 200
+    assert _preview(two)["stamp"] == s0
+    assert _delete_with(two, "notes-w1", {"stamp": s0}).status_code == 200
+
+
+def _delete_with(client, key, body):
+    return client.delete(f"{WATCH}/{key}", json=body)
+
+
+def test_a_note_saved_after_the_question_opened_makes_the_delete_a_409_that_removes_nothing(two, db):
+    a = _img(db, 1)
+    v1 = _save_note(two, "notes-w1", [a])
+    p = _preview(two)
+    _save_note(two, "notes-w1", [a], text="saved from the phone", base=v1)            # lands after the question opened
+    before = _tables(db)
+    r = _delete_with(two, "notes-w1", {"stamp": p["stamp"], "keep_image_ids": []})
+    j = r.get_json()
+    assert r.status_code == 409 and j["changed"] is True
+    assert "changed after the question opened" in j["error"]
+    assert [i["key"] for i in j["items"]] == ["notes-w1", "notes-w2"]                 # the current list comes with it
+    assert _tables(db) == before
+    p2 = _preview(two)                                                                # the counts now, then a second try
+    assert p2["note_versions"] == 2 and p2["stamp"] != p["stamp"]
+    r2 = _delete_with(two, "notes-w1", {"stamp": p2["stamp"], "keep_image_ids": []})
+    assert r2.status_code == 200 and r2.get_json()["note_versions"] == 2 and r2.get_json()["freed"]["count"] == 1
+
+
+@pytest.mark.parametrize("body", [{"priority": "low"}, {"summary": "edited elsewhere"}, {"active": False}])
+def test_a_change_to_the_item_after_the_question_opened_is_a_409(two, db, body):
+    _save_note(two, "notes-w1", text="n")
+    p = _preview(two)
+    assert two.put(f"{WATCH}/notes-w1", json=body).status_code == 200
+    before = _tables(db)
+    r = _delete_with(two, "notes-w1", {"stamp": p["stamp"]})
+    assert r.status_code == 409 and r.get_json()["changed"] is True and _tables(db) == before
+
+
+def test_the_stamp_is_checked_before_anything_is_worked_out_or_removed(two, db, monkeypatch):
+    p = _preview(two)
+    _save_note(two, "notes-w1", text="later")
+    monkeypatch.setattr(wp, "_watch_delete_plan", lambda *a, **k: (_ for _ in ()).throw(AssertionError("planned")))
+    assert _delete_with(two, "notes-w1", {"stamp": p["stamp"]}).status_code == 409
+
+
+def test_a_current_stamp_deletes_as_before(two, db):
+    a, b = _img(db, 1, 100), _img(db, 2, 200)
+    _save_note(two, "notes-w1", [a, b])
+    p = _preview(two, keep=str(b))
+    r = _delete_with(two, "notes-w1", {"stamp": p["stamp"], "keep_image_ids": [b]})
+    j = r.get_json()
+    assert r.status_code == 200 and j["deleted"] == "notes-w1" and j["freed"] == {"count": 1, "bytes": 100}
+    assert j["kept_for_drafts"] == {"count": 1, "bytes": 200} and _image_ids(db) == [b]
+
+
+def test_a_delete_without_a_stamp_still_works(two, db):
+    """A page loaded before this landing sends no stamp; its delete goes through as it did."""
+    a = _img(db, 1)
+    _save_note(two, "notes-w1", [a])
+    assert _delete_with(two, "notes-w1", {"keep_image_ids": []}).status_code == 200
+    assert _delete_with(two, "notes-w2", {"stamp": None}).status_code == 200
+
+
+def test_a_note_saved_while_the_preview_was_being_worked_out_makes_the_delete_a_409(two, db, monkeypatch):
+    """The stamp is read before the counts. A save that lands between the two reads leaves the stamp older than the
+    state, so the delete that uses it is refused (read in the other order, the stamp would be new and the counts old)."""
+    v1 = _save_note(two, "notes-w1", text="first")
+    real = wp._watch_delete_plan
+    state = {"first": True}
+
+    def plan_then_a_save_lands(conn, key, keep=frozenset()):
+        out = real(conn, key, keep)
+        if state["first"]:
+            state["first"] = False
+            other = portfolio_db.get_connection()
+            other.execute("INSERT INTO page_notes (page, body_json, body_text, created_at) VALUES (?, ?, ?, 'now')",
+                          (key, json.dumps({"ops": [{"insert": "saved elsewhere" + chr(10)}]}), "saved elsewhere"))
+            other.commit()
+            other.close()
+        return out
+
+    monkeypatch.setattr(wp, "_watch_delete_plan", plan_then_a_save_lands)
+    p = _preview(two)
+    assert p["note_versions"] == 1                                       # the counts the question shows are the old ones
+    monkeypatch.setattr(wp, "_watch_delete_plan", real)
+    r = _delete_with(two, "notes-w1", {"stamp": p["stamp"]})
+    assert r.status_code == 409 and r.get_json()["changed"] is True
+    assert db.execute("SELECT COUNT(*) FROM page_notes WHERE page = 'notes-w1'").fetchone()[0] == 2
+    assert v1 and _delete_with(two, "notes-w1", {"stamp": _preview(two)["stamp"]}).status_code == 200
+
+
+def test_a_saved_trend_after_the_question_opened_does_not_stop_the_delete(two, db):
+    """watch_trend is not in the stamp (by design): a trend check landing in between only adds a cache row the delete removes."""
+    p = _preview(two)
+    db.execute("UPDATE watch_trend SET computed_at = 'later' WHERE item_key = 'notes-w1'")
+    db.commit()
+    assert _delete_with(two, "notes-w1", {"stamp": p["stamp"]}).status_code == 200
+    assert db.execute("SELECT COUNT(*) FROM watch_trend WHERE item_key = 'notes-w1'").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("stamp", [5, "abc", "1:2:3", ":1", "1:", "1:" + "9" * 20, "", ["1:1"], {"a": 1}, True, "1:1 ", "-1:1"])
+def test_a_bad_stamp_is_400_and_deletes_nothing(two, db, stamp):
+    before = _tables(db)
+    assert _delete_with(two, "notes-w1", {"stamp": stamp}).status_code == 400
+    assert _tables(db) == before
+
+
+def test_a_stale_stamp_for_an_item_deleted_elsewhere_is_a_404(two):
+    p = _preview(two)
+    assert _delete_with(two, "notes-w1", {"stamp": p["stamp"]}).status_code == 200
+    assert _delete_with(two, "notes-w1", {"stamp": p["stamp"]}).status_code == 404       # gone, not "changed"
+
+
+def test_the_body_may_only_hold_the_keep_list_and_the_stamp(two):
+    assert _delete_with(two, "notes-w1", {"stamp": _preview(two)["stamp"], "other": 1}).status_code == 400
+    assert "notes-w1" in [i["key"] for i in view(two)["items"]]
 
 
 # -- priority (Landing 82) -------------------------------------------------------------
