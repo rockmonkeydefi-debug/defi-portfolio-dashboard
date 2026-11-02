@@ -4,7 +4,10 @@ GET / POST /api/note-tabs, PUT /api/note-tabs/order and
 PUT /api/note-tabs/<key>. Watchlist and Nuggets exist without a row
 (NOTE_TAB_DEFAULTS); added tabs get the keys notes-t1, notes-t2, ...; a
 tab's note is the page_notes note under its key, which the notes routes
-now accept, archived tabs included. Nothing is deleted.
+now accept, archived tabs included. Landing 83: DELETE /api/note-tabs/<key>
+(and its delete-preview) removes a tab for good - a row with deleted = 1,
+its notes and the images no other note uses; note_tabs rows themselves are
+still never updated or deleted.
 
 Real init_db() on a tmp_path SQLite file (portfolio_db.get_db_path
 monkeypatched). No network.
@@ -13,6 +16,7 @@ web_portfolio spawns a background scheduler on non-__main__ import; we
 neutralize threading.Thread.start during import (established pattern).
 """
 import json
+import re
 import sqlite3
 import threading
 
@@ -96,7 +100,7 @@ DEFAULT_BAR = [("notes-watchlist", "Watchlist"), ("notes-nuggets", "Nuggets")]
 
 def test_table_and_index_exist_and_init_db_runs_twice(db):
     cols = [r[1] for r in db.execute("PRAGMA table_info(note_tabs)")]
-    assert cols == ["id", "tab_key", "label", "position", "archived", "created_at"]
+    assert cols == ["id", "tab_key", "label", "position", "archived", "created_at", "deleted"]   # deleted: Landing 83
     assert "idx_note_tabs_key" in {r[1] for r in db.execute("PRAGMA index_list(note_tabs)")}
     portfolio_db.init_db()
     assert [r[1] for r in db.execute("PRAGMA table_info(note_tabs)")] == cols
@@ -265,14 +269,17 @@ def test_the_tab_bar_holds_at_most_20_tabs(client, db):
     assert add(client, "One more").status_code == 201
 
 
-def test_at_most_200_tabs_are_ever_added(client, db, monkeypatch):
+def test_at_most_200_added_tabs_are_kept(client, db, monkeypatch):
     monkeypatch.setattr(wp, "NOTE_TABS_TOTAL_MAX", 3)
     for i in range(3):
         add(client, f"Tab {i}")
         change(client, f"notes-t{i + 1}", archived=True)
     r = add(client, "Fourth")
-    assert r.status_code == 409 and "restore an archived tab" in r.get_json()["error"]
+    assert r.status_code == 409 and "archived ones included; delete an archived tab first" in r.get_json()["error"]
     assert len(bar(client)) == 2
+    # Landing 83: deleting an archived tab frees its place (its key is still never used again).
+    assert delete(client, "notes-t2").status_code == 200
+    assert add(client, "Fourth").get_json()["key"] == "notes-t4"
 
 
 def test_keys_are_never_reused(client):
@@ -321,10 +328,12 @@ def test_a_failed_tab_lookup_is_500_not_404(client, monkeypatch):
     assert client.put("/api/page-notes/notes-t1", json={"delta": doc("x"), "base_id": None}).status_code == 500
 
 
-def test_spot_and_the_default_tabs_need_no_lookup(client, monkeypatch):
-    monkeypatch.setattr(portfolio_db, "get_connection", lambda: (_ for _ in ()).throw(AssertionError("no lookup")))
+def test_spot_needs_no_lookup_and_the_default_tabs_are_known_until_deleted(client, monkeypatch):
+    # Landing 83: a default tab can be deleted, so knowing one reads note_tabs; the Spot note never does.
     for page in wp.PAGE_NOTE_PAGES:
         assert wp._page_note_page_known(page) is True
+    monkeypatch.setattr(portfolio_db, "get_connection", lambda: (_ for _ in ()).throw(AssertionError("no lookup")))
+    assert wp._page_note_page_known("spot") is True
     assert wp._page_note_page_known("perps") is False
     assert wp._page_note_page_known("notes-x") is False
 
@@ -685,3 +694,273 @@ def test_the_copy_counts_toward_the_keys_and_keys_are_not_reused(client, db):
     copy(client, "notes-t1")
     change(client, "notes-t2", archived=True)
     assert add(client, "B").get_json()["key"] == "notes-t3"
+
+
+# -- Delete a tab (Landing 83) ------------------------------------------------------------
+
+
+def delete(client, key, **kw):
+    return client.delete(f"{TABS}/{key}", **kw)
+
+
+def preview(client, key, keep=None):
+    return client.get(f"{TABS}/{key}/delete-preview" + (f"?keep={keep}" if keep is not None else ""))
+
+
+def store_image(db, n, size=100):
+    cur = db.execute("INSERT INTO note_images (sha256, mime, width, height, bytes, data, created_at) "
+                     "VALUES (?, 'image/png', 4, 4, ?, ?, 'now')", (str(n) * 64, size, b"x" * size))
+    db.commit()
+    return cur.lastrowid
+
+
+def save_images(client, key, ids, base=None, text="chart"):
+    ops = [{"insert": text + " "}] + [{"insert": {"image": f"/api/note-images/{i}"}} for i in ids] + [{"insert": "\n"}]
+    r = client.put(f"/api/page-notes/{key}", json={"delta": {"ops": ops}, "base_id": base})
+    assert r.status_code == 200, r.get_json()
+    return r.get_json()["id"]
+
+
+def counts(db):
+    return (len(rows(db)), db.execute("SELECT COUNT(*) FROM page_notes").fetchone()[0],
+            db.execute("SELECT COUNT(*) FROM note_images").fetchone()[0])
+
+
+def test_the_deleted_column_refuses_anything_but_0_or_1(db):
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute("INSERT INTO note_tabs (tab_key, label, position, archived, deleted, created_at) "
+                   "VALUES ('notes-t1', 'x', 0, 0, 2, 'now')")
+    db.execute("INSERT INTO note_tabs (tab_key, label, position, archived, created_at) VALUES ('notes-t1', 'x', 0, 0, 'now')")
+    assert db.execute("SELECT deleted FROM note_tabs").fetchone()[0] == 0          # rows written as before read 0
+
+
+def test_deleting_an_open_tab_removes_it_and_every_saved_version(client, db):
+    add(client, "Setups")
+    add(client, "Levels")
+    v1 = save(client, "notes-t1", "first")
+    save(client, "notes-t1", "second", base=v1)
+    save(client, "notes-t2", "keep me")
+    r = delete(client, "notes-t1")
+    assert r.status_code == 200
+    j = r.get_json()
+    assert (j["deleted"], j["label"], j["note_versions"]) == ("notes-t1", "Setups", 2)
+    assert j["freed"] == {"count": 0, "bytes": 0} and j["kept_for_drafts"] == {"count": 0, "bytes": 0}
+    assert j["usage"]["count"] == 0 and j["usage"]["max_bytes"] == wp.NOTE_IMAGES_TOTAL_MAX_BYTES
+    assert [(t["key"], t["label"]) for t in j["tabs"]] == DEFAULT_BAR + [("notes-t2", "Levels")]
+    assert bar(client) == DEFAULT_BAR + [("notes-t2", "Levels")] and archived(client) == []
+    assert db.execute("SELECT COUNT(*) FROM page_notes WHERE page = 'notes-t1'").fetchone()[0] == 0
+    assert client.get("/api/page-notes/notes-t2").get_json()["text"] == "keep me"
+    last = rows(db)[-1]
+    assert (last["tab_key"], last["label"], last["archived"], last["deleted"]) == ("notes-t1", "Setups", 0, 1)
+
+
+def test_a_default_tab_can_be_deleted_and_stays_gone(client, db):
+    save(client, "notes-watchlist", "WIF, PEPE")
+    save(client, "notes-nuggets", "cut losers")
+    r = delete(client, "notes-watchlist")
+    assert r.status_code == 200 and r.get_json()["label"] == "Watchlist" and r.get_json()["note_versions"] == 1
+    assert bar(client) == [("notes-nuggets", "Nuggets")]
+    assert client.get("/api/page-notes/notes-watchlist").status_code == 404
+    assert client.put("/api/page-notes/notes-watchlist", json={"delta": doc("x"), "base_id": None}).status_code == 404
+    portfolio_db.init_db()                                                             # a restart does not bring it back
+    assert bar(client) == [("notes-nuggets", "Nuggets")]
+    assert client.get("/api/page-notes/notes-nuggets").get_json()["text"] == "cut losers"
+    assert wp._page_note_page_known("notes-watchlist") is False and wp._page_note_page_known("notes-nuggets") is True
+
+
+def test_an_archived_tab_can_be_deleted(client, db):
+    add(client, "Old")
+    save(client, "notes-t1", "old idea")
+    change(client, "notes-t1", archived=True)
+    p = preview(client, "notes-t1").get_json()
+    assert (p["archived"], p["last_open"], p["note_versions"]) == (True, False, 1)
+    r = delete(client, "notes-t1")
+    assert r.status_code == 200
+    assert archived(client) == [] and bar(client) == DEFAULT_BAR
+
+
+def test_the_last_open_tab_cant_be_deleted_but_an_archived_one_can(client, db):
+    change(client, "notes-watchlist", archived=True)
+    assert preview(client, "notes-nuggets").get_json()["last_open"] is True
+    before = counts(db)
+    r = delete(client, "notes-nuggets")
+    assert r.status_code == 409 and "last open tab" in r.get_json()["error"] and r.get_json()["tabs"]
+    assert counts(db) == before
+    assert delete(client, "notes-watchlist").status_code == 200                       # archived: fine with one tab open
+    assert bar(client) == [("notes-nuggets", "Nuggets")] and archived(client) == []
+
+
+def test_a_deleted_tab_is_unknown_to_every_route(client, db):
+    add(client, "Setups")
+    add(client, "Levels")
+    delete(client, "notes-t1")
+    n = counts(db)
+    assert change(client, "notes-t1", label="Back").status_code == 404
+    assert change(client, "notes-t1", archived=False).status_code == 404
+    assert copy(client, "notes-t1").status_code == 404
+    assert delete(client, "notes-t1").status_code == 404
+    assert preview(client, "notes-t1").status_code == 404
+    assert order(client, ["notes-watchlist", "notes-nuggets", "notes-t1", "notes-t2"]).status_code == 409
+    assert client.get("/api/page-notes/notes-t1").status_code == 404
+    assert client.put("/api/page-notes/notes-t1", json={"delta": doc("x"), "base_id": None}).status_code == 404
+    assert counts(db) == n
+    r = order(client, ["notes-t2", "notes-watchlist", "notes-nuggets"])               # the rest still reorder
+    assert r.status_code == 200 and [k for k, _ in bar(client)] == ["notes-t2", "notes-watchlist", "notes-nuggets"]
+
+
+def test_keys_are_never_reused_but_a_deleted_tab_frees_its_place_in_the_limit(client, db, monkeypatch):
+    add(client, "A")
+    add(client, "B")
+    delete(client, "notes-t2")
+    assert add(client, "C").get_json()["key"] == "notes-t3"
+    assert add(client, "B").get_json()["key"] == "notes-t4"                           # the deleted name is free again
+    monkeypatch.setattr(wp, "NOTE_TABS_TOTAL_MAX", 3)                                # t1, t3, t4 are kept
+    r = add(client, "D")
+    assert r.status_code == 409 and "at most 3" in r.get_json()["error"]
+    assert copy(client, "notes-t1").status_code == 409
+    delete(client, "notes-t4")
+    assert add(client, "D").get_json()["key"] == "notes-t5"
+
+
+def test_images_only_this_tab_uses_are_freed_and_shared_ones_stay(client, db):
+    i1, i2, i3, i4 = (store_image(db, n, size=100 * n) for n in (1, 2, 3, 4))
+    add(client, "Charts")
+    v1 = save_images(client, "notes-t1", [i1])                    # only in an old version: still this tab's
+    v2 = save_images(client, "notes-t1", [i2], base=v1)
+    copy(client, "notes-t1")                                      # notes-t2 shares i2
+    save_images(client, "notes-t1", [i3, i4], base=v2)
+    db.execute("INSERT INTO page_notes (page, body_json, body_text, created_at) VALUES ('notes-w1', ?, 'x', 'now')",
+               (json.dumps({"ops": [{"insert": {"image": f"/api/note-images/{i4}"}}, {"insert": "\n"}]}),))
+    db.commit()                                                   # a Watch List note shares i4
+    p = preview(client, "notes-t1").get_json()
+    assert p["note_versions"] == 3
+    assert p["images"] == {"count": 4, "bytes": 1000} and p["frees"] == {"count": 2, "bytes": 400}
+    r = delete(client, "notes-t1")
+    assert r.status_code == 200 and r.get_json()["freed"] == {"count": 2, "bytes": 400}
+    assert r.get_json()["usage"]["count"] == 2 and r.get_json()["usage"]["bytes"] == 600
+    assert sorted(x[0] for x in db.execute("SELECT id FROM note_images")) == [i2, i4]
+    assert f"/api/note-images/{i2}" in json.dumps(client.get("/api/page-notes/notes-t2").get_json()["delta"])
+    assert client.get(f"/api/note-images/{i2}").status_code == 200
+
+
+def test_images_an_unsaved_note_uses_are_kept(client, db):
+    i1, i2 = store_image(db, 1), store_image(db, 2)
+    add(client, "Charts")
+    save_images(client, "notes-t1", [i1, i2])
+    p = preview(client, "notes-t1", keep=str(i1)).get_json()
+    assert p["frees"]["count"] == 1 and p["kept_for_drafts"]["count"] == 1
+    r = delete(client, "notes-t1", json={"keep_image_ids": [i1]})
+    assert r.status_code == 200 and r.get_json()["kept_for_drafts"]["count"] == 1 and r.get_json()["freed"]["count"] == 1
+    assert [x[0] for x in db.execute("SELECT id FROM note_images")] == [i1]
+
+
+@pytest.mark.parametrize("kw", [
+    {"json": {"x": 1}}, {"json": []}, {"data": "x", "content_type": "text/plain"},
+    {"json": {"keep_image_ids": "1"}}, {"json": {"keep_image_ids": [0]}}, {"json": {"keep_image_ids": [True]}},
+    {"json": {"keep_image_ids": [1.5]}}, {"json": {"keep_image_ids": list(range(1, 2002))}},
+])
+def test_bad_delete_bodies_are_400_and_delete_nothing(client, db, kw):
+    add(client, "Setups")
+    before = counts(db)
+    assert delete(client, "notes-t1", **kw).status_code == 400
+    assert counts(db) == before and bar(client)[-1] == ("notes-t1", "Setups")
+
+
+def test_an_empty_body_and_an_empty_keep_list_are_fine(client):
+    add(client, "A")
+    add(client, "B")
+    assert delete(client, "notes-t1", json={}).status_code == 200
+    assert delete(client, "notes-t2", json={"keep_image_ids": []}).status_code == 200
+
+
+@pytest.mark.parametrize("keep", ["abc", "1,,2", "0", "-1", "12345678901"])
+def test_a_bad_keep_list_on_the_preview_is_400(client, keep):
+    assert preview(client, "notes-watchlist", keep=keep).status_code == 400
+
+
+@pytest.mark.parametrize("key", ["notes-t9", "notes-x", "spot", "notes-w1"])
+def test_deleting_an_unknown_tab_is_404_and_writes_nothing(client, db, key):
+    assert delete(client, key).status_code == 404 and preview(client, key).status_code == 404 and rows(db) == []
+
+
+def test_the_preview_writes_nothing(client, db):
+    i1 = store_image(db, 1)
+    add(client, "Charts")
+    save_images(client, "notes-t1", [i1])
+    before = counts(db)
+    p = preview(client, "notes-t1").get_json()
+    assert (p["key"], p["label"], p["note_versions"], p["frees"]["count"]) == ("notes-t1", "Charts", 1, 1)
+    assert counts(db) == before
+
+
+def test_a_failure_midway_deletes_nothing(client, db, monkeypatch):
+    i1 = store_image(db, 1)
+    add(client, "Charts")
+    save_images(client, "notes-t1", [i1])
+    before = counts(db)
+    monkeypatch.setattr(wp, "_note_images_usage", lambda conn: (_ for _ in ()).throw(RuntimeError("secret")))
+    r = delete(client, "notes-t1")
+    assert r.status_code == 500 and "secret" not in r.get_data(as_text=True) and "Nothing was changed" in r.get_json()["error"]
+    assert counts(db) == before and bar(client)[-1] == ("notes-t1", "Charts")
+
+
+@pytest.mark.parametrize("key", ["notes-t1", "notes-watchlist"])
+def test_a_save_that_races_a_delete_is_refused(client, db, monkeypatch, key):
+    add(client, "Setups")
+    delete(client, key)
+    n = db.execute("SELECT COUNT(*) FROM page_notes").fetchone()[0]
+    monkeypatch.setattr(wp, "_page_note_page_known", lambda page: True)   # the page was looked up before the delete
+    r = client.put(f"/api/page-notes/{key}", json={"delta": doc("late save"), "base_id": None})
+    assert r.status_code == 404
+    assert db.execute("SELECT COUNT(*) FROM page_notes").fetchone()[0] == n
+
+
+def test_other_notes_are_untouched(client, db):
+    client.put("/api/page-notes/spot", json={"delta": doc("spot plan"), "base_id": None})
+    save(client, "notes-nuggets", "tip")
+    add(client, "Setups")
+    save(client, "notes-t1", "gone soon")
+    delete(client, "notes-t1")
+    assert client.get("/api/page-notes/spot").get_json()["text"] == "spot plan"
+    assert client.get("/api/page-notes/notes-nuggets").get_json()["text"] == "tip"
+
+
+def test_deleting_needs_the_login(db, monkeypatch):
+    monkeypatch.setattr(wp, "get_password_hash", lambda: "x")
+    c = wp.app.test_client()
+    assert c.delete(f"{TABS}/notes-watchlist").status_code == 401
+    assert c.get(f"{TABS}/notes-watchlist/delete-preview").status_code == 401
+    assert rows(db) == []
+
+
+
+def test_the_preview_stamp_guards_against_a_change_in_between(client, db):
+    add(client, "Setups")
+    v1 = save(client, "notes-t1", "first")
+    p = preview(client, "notes-t1").get_json()
+    assert re.fullmatch(r"[0-9]+:[0-9]+", p["stamp"]) and p["note_versions"] == 1
+    save(client, "notes-t1", "saved from the phone", base=v1)                       # lands after the question opened
+    before = counts(db)
+    r = delete(client, "notes-t1", json={"stamp": p["stamp"]})
+    assert r.status_code == 409 and r.get_json()["changed"] is True and r.get_json()["tabs"]
+    assert counts(db) == before
+    p2 = preview(client, "notes-t1").get_json()
+    assert p2["note_versions"] == 2 and p2["stamp"] != p["stamp"]
+    change(client, "notes-t1", label="Renamed")                                    # a tab change moves the stamp too
+    assert delete(client, "notes-t1", json={"stamp": p2["stamp"]}).status_code == 409
+    p3 = preview(client, "notes-t1").get_json()
+    r = delete(client, "notes-t1", json={"stamp": p3["stamp"], "keep_image_ids": []})
+    assert r.status_code == 200 and r.get_json()["note_versions"] == 2
+
+
+def test_a_default_tab_without_rows_has_a_stamp(client):
+    p = preview(client, "notes-nuggets").get_json()
+    assert p["stamp"] == "0:0"
+    assert delete(client, "notes-nuggets", json={"stamp": "0:0"}).status_code == 200
+
+
+@pytest.mark.parametrize("stamp", [5, "abc", "1:2:3", ":1", "1:", "1:" + "9" * 20, ""])
+def test_a_bad_stamp_is_400(client, db, stamp):
+    add(client, "Setups")
+    before = counts(db)
+    assert delete(client, "notes-t1", json={"stamp": stamp}).status_code == 400 and counts(db) == before

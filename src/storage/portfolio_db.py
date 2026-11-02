@@ -941,9 +941,10 @@ def init_db():
     """)
 
     # Page notes (Landing 19): a formatted notes box at the top of a page (the
-    # Spot page today). Append-only: one row per save, never updated or
-    # deleted; the latest row per page (highest id) is the current note, so
-    # every saved version is kept. body_json is the editor's document (a Quill
+    # Spot page today). Append-only: one row per save, never updated; a page's
+    # rows are deleted only when its Watch List item (Landing 79) or its Notes
+    # tab (Landing 83) is deleted. The latest row per page (highest id) is the
+    # current note, so every saved version is kept. body_json is the editor's document (a Quill
     # Delta, {"ops": [...]}, checked by the route: text inserts and an
     # allowlist of formats only, never HTML); body_text is its plain text.
     # The route checks page against web_portfolio.PAGE_NOTE_PAGES and the
@@ -966,7 +967,9 @@ def init_db():
     # Notes page tabs (Landing 31): the tabs added, renamed, moved and
     # archived on the Notes page. Append-only: one row per change, never
     # updated or deleted, holding the tab's whole state after the change; the
-    # latest row per tab_key (highest id) is the tab's current state.
+    # latest row per tab_key (highest id) is the tab's current state. Deleting
+    # a tab (Landing 83) appends a row with deleted = 1, so its key is never
+    # handed out again (the column is added by the migrations below).
     # Watchlist and Nuggets exist without a row (web_portfolio.
     # NOTE_TAB_DEFAULTS); a row records a change to one of them. Added tabs'
     # keys are notes-t1, notes-t2, ... (up to six digits). A tab's note is the
@@ -1838,6 +1841,11 @@ def init_db():
         # rows written before Landing 82 read 'medium'. Active items are listed
         # High, then Medium, then Low.
         ("watch_items", "priority", "TEXT NOT NULL DEFAULT 'medium' CHECK (priority IN ('high', 'medium', 'low'))"),
+        # Landing 83 (Nov 1): a Notes tab deleted for good. Its latest row has
+        # deleted = 1 (a tombstone: the tab, its notes and every saved version
+        # are gone, and the key is never used again); every other row, and
+        # every row written before Landing 83, reads 0.
+        ("note_tabs", "deleted", "INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1))"),
     ]
     for table, col, col_type in migrations:
         try:
