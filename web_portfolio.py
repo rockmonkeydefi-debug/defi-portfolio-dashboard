@@ -6876,16 +6876,32 @@ def _note_now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def _note_revision(conn, kind, ref, old_text, action, now=None):
+# The stored form of a note with nothing in it (what _page_note_check keeps for one empty line).
+_NOTE_EMPTY_DOC_JSON = json.dumps({"ops": [{"insert": "\n"}]}, separators=(",", ":"), ensure_ascii=False, sort_keys=True)
+
+
+def _note_revision(conn, kind, ref, old_text, action, now=None, old_json=None):
     """Keep an earlier version of note text in note_revisions (Oct 3 ruling:
     hidden in the UI, kept for reviews and the future advisor). A no-op unless
-    old_text is a non-empty string. The caller commits, so the earlier version
-    and the change it belongs to land in one transaction."""
-    if not isinstance(old_text, str) or old_text == '':
+    old_text is a non-empty string (Landing 88: or old_json holds a document
+    with something in it). The caller commits, so the earlier version
+    and the change it belongs to land in one transaction. Landing 88: old_json
+    is the editor document the note had (None for plain text); the stored-image
+    scan reads it, so an image only an old version used is not freed."""
+    if not isinstance(old_text, str):
+        return
+    if old_text == '' and not (isinstance(old_json, str) and old_json not in ('', _NOTE_EMPTY_DOC_JSON)):
+        return          # nothing written: no text, and no document with anything in it (a table, a colour)
+    if old_json is None:
+        # Plain text (every writer but the Spot editor): the same five columns as before Landing 88, so these
+        # writes never depend on the old_json column.
+        conn.execute(
+            "INSERT INTO note_revisions (kind, ref, old_text, action, revised_at) VALUES (?, ?, ?, ?, ?)",
+            (kind, str(ref), old_text, action, now or _note_now()))
         return
     conn.execute(
-        "INSERT INTO note_revisions (kind, ref, old_text, action, revised_at) VALUES (?, ?, ?, ?, ?)",
-        (kind, str(ref), old_text, action, now or _note_now()))
+        "INSERT INTO note_revisions (kind, ref, old_text, action, revised_at, old_json) VALUES (?, ?, ?, ?, ?, ?)",
+        (kind, str(ref), old_text, action, now or _note_now(), old_json))
 
 
 def _trades_ms_iso(ms):
@@ -14351,21 +14367,139 @@ def api_spot_token_config_delete(symbol):
         return jsonify({'error': str(e)}), 500
 
 
+def _spot_note_token(note, body_json):
+    """Landing 88: the version of a Spot Summary, for the editor's conflict check (a hash of what is stored, so it
+    needs no column): 16 hex characters. The token of a position with no row yet is None."""
+    import hashlib
+    return hashlib.sha256(((note or '') + '\x00' + (body_json or '')).encode('utf-8')).hexdigest()[:16]
+
+
+def _spot_summary_saved_at(updated_at):
+    """SQLite's CURRENT_TIMESTAMP ('YYYY-MM-DD HH:MM:SS', UTC) as ISO 8601 with its offset, else unchanged."""
+    if isinstance(updated_at, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", updated_at):
+        return updated_at.replace(' ', 'T') + '+00:00'
+    return updated_at
+
+
+def _spot_summary_view(row):
+    """A spot_position_notes row (or None) as the Summary editor reads it: {"id" (the version token, None with no
+    row), "delta" (the editor document, None for text written before Landing 88 or no row), "text" (the plain-text
+    mirror), "saved_at", "empty" (no visible text), "legacy" (plain text with no document)}."""
+    if row is None:
+        return {"id": None, "delta": None, "text": "", "saved_at": None, "empty": True, "legacy": False}
+    note = row["note"] or ""
+    body_json = row["body_json"]
+    return {"id": _spot_note_token(note, body_json), "delta": json.loads(body_json) if body_json else None,
+            "text": note, "saved_at": _spot_summary_saved_at(row["updated_at"]), "empty": note.strip() == "",
+            "legacy": body_json is None and note != ""}
+
+
 @app.route('/api/spot/position-notes', methods=['GET'])
 def api_spot_position_notes_list():
-    """Every spot_position_notes row, newest-updated first. Read-only."""
+    """Every spot_position_notes row, newest-updated first. Read-only. Landing 88: "delta" is the editor document
+    (None for text written before the full editor, which has only "note")."""
     try:
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
         rows = conn.execute(
-            "SELECT chain, contract_address, note, updated_at "
+            "SELECT chain, contract_address, note, updated_at, body_json "
             "FROM spot_position_notes ORDER BY updated_at DESC"
         ).fetchall()
         conn.close()
-        return jsonify([dict(r) for r in rows])
+        out = []
+        for r in rows:
+            d = dict(r)
+            body_json = d.pop('body_json')
+            d['delta'] = json.loads(body_json) if body_json else None
+            out.append(d)
+        return jsonify(out)
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/spot/position-notes/view', methods=['GET'])
+def api_spot_position_notes_view():
+    """Landing 88: one position's Summary as the editor reads it (_spot_summary_view). ?chain=&contract_address=,
+    both required. A position with no row answers the empty view. Read-only."""
+    chain = (request.args.get('chain') or '').strip()
+    contract_address = (request.args.get('contract_address') or '').strip()
+    if not chain or not contract_address:
+        return jsonify({'error': 'chain and contract_address are required'}), 400
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            row = conn.execute(
+                "SELECT note, body_json, updated_at FROM spot_position_notes WHERE chain=? AND contract_address=?",
+                (chain, contract_address)).fetchone()
+        finally:
+            conn.close()
+        return jsonify(_spot_summary_view(row))
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+def _spot_summary_save_rich(data, chain, contract_address):
+    """Landing 88: save a Summary written in the Notes page editor. data = {"chain", "contract_address", "delta":
+    the editor document (_page_note_check, images allowed), "base_id": the token the edit started from (None when
+    the position had no Summary)}. 400 for a bad body or document or an image that is not stored; 409 when the
+    stored Summary is not the one the edit started from (saved elsewhere since), with {"error", "current"}. A
+    document equal to the stored one writes nothing ("changed": false). The earlier text and document go to
+    note_revisions in the same transaction. Returns _spot_summary_view plus "changed"."""
+    if 'note' in data:
+        return jsonify({'error': 'send either note or delta, not both'}), 400
+    base_id = data.get('base_id')
+    if base_id is not None and not (isinstance(base_id, str) and re.fullmatch(r"[0-9a-f]{16}", base_id)):
+        return jsonify({'error': 'base_id must be a version token or null'}), 400
+    body_json, body_text, err = _page_note_check(data['delta'], images_ok=True)
+    if err:
+        return jsonify({'error': err}), 400
+    image_ids = _page_note_image_ids(body_json)
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        # One writer at a time: the version check and the write must see the same stored Summary.
+        conn.execute("BEGIN IMMEDIATE")
+        if image_ids:
+            found = {r[0] for r in conn.execute(
+                f"SELECT id FROM note_images WHERE id IN ({','.join('?' * len(image_ids))})", image_ids)}
+            if len(found) != len(image_ids):
+                conn.rollback()
+                return jsonify({'error': "an image in this note isn't stored on the server; "
+                                         "remove it and paste it again"}), 400
+        prev = conn.execute(
+            "SELECT note, body_json, updated_at FROM spot_position_notes WHERE chain=? AND contract_address=?",
+            (chain, contract_address)).fetchone()
+        current = _spot_note_token(prev['note'], prev['body_json']) if prev is not None else None
+        if base_id != current:
+            conn.rollback()
+            return jsonify({'error': 'this summary was saved from another tab or device after you started '
+                                     'editing', 'current': _spot_summary_view(prev)}), 409
+        if prev is not None and prev['body_json'] == body_json and prev['note'] == body_text:
+            conn.rollback()
+            return jsonify({**_spot_summary_view(prev), 'changed': False})
+        if prev is not None:
+            # Keep the earlier Summary (text and document), committed with the change below.
+            _note_revision(conn, 'spot_summary', chain + ' ' + contract_address, prev['note'], 'edit',
+                           old_json=prev['body_json'])
+        conn.execute(
+            """INSERT INTO spot_position_notes (chain, contract_address, note, body_json)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(chain, contract_address)
+               DO UPDATE SET note=excluded.note, body_json=excluded.body_json, updated_at=CURRENT_TIMESTAMP""",
+            (chain, contract_address, body_text, body_json))
+        conn.commit()
+        row = conn.execute(
+            "SELECT note, body_json, updated_at FROM spot_position_notes WHERE chain=? AND contract_address=?",
+            (chain, contract_address)).fetchone()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return jsonify({**_spot_summary_view(row), 'changed': True})
 
 
 @app.route('/api/spot/position-notes', methods=['PUT'])
@@ -14380,6 +14514,10 @@ def api_spot_position_notes_upsert():
     since a note attached there would silently detach the moment the address
     is backfilled and the position's identity flips from a bare symbol string
     to a (chain, address) tuple.
+
+    Landing 88: a body with "delta" (and "base_id") saves the Summary written
+    in the Notes page editor (_spot_summary_save_rich); a plain "note" on a
+    Summary already saved that way is refused (409).
     """
     try:
         from src.storage.portfolio_db import get_connection
@@ -14395,6 +14533,10 @@ def api_spot_position_notes_upsert():
             return jsonify({'error': 'contract_address is required'}), 400
         contract_address = contract_address.strip()
 
+        if 'delta' in data:
+            # Landing 88: a Summary written in the Notes page editor.
+            return _spot_summary_save_rich(data, chain, contract_address)
+
         note = data.get('note', '')
         if not isinstance(note, str):
             return jsonify({'error': 'note must be a string'}), 400
@@ -14402,27 +14544,36 @@ def api_spot_position_notes_upsert():
             return jsonify({'error': f'note must be {SPOT_NOTE_MAX} characters or fewer'}), 400
 
         conn = get_connection()
-        prev = conn.execute(
-            "SELECT note FROM spot_position_notes WHERE chain=? AND contract_address=?",
-            (chain, contract_address)
-        ).fetchone()
-        if prev is not None and prev['note'] != note:
-            # Keep the earlier Summary text (committed with the change below).
-            _note_revision(conn, 'spot_summary', chain + ' ' + contract_address, prev['note'], 'edit')
-        conn.execute(
-            """INSERT INTO spot_position_notes (chain, contract_address, note)
-               VALUES (?, ?, ?)
-               ON CONFLICT(chain, contract_address)
-               DO UPDATE SET note=excluded.note, updated_at=CURRENT_TIMESTAMP""",
-            (chain, contract_address, note)
-        )
-        conn.commit()
-        row = conn.execute(
-            "SELECT chain, contract_address, note, updated_at "
-            "FROM spot_position_notes WHERE chain=? AND contract_address=?",
-            (chain, contract_address)
-        ).fetchone()
-        conn.close()
+        try:
+            # Landing 88: the read of the stored Summary and the write below happen under one write lock, so a
+            # formatted Summary saved meanwhile (_spot_summary_save_rich) is seen, never half overwritten.
+            conn.execute("BEGIN IMMEDIATE")
+            prev = conn.execute(
+                "SELECT note, body_json FROM spot_position_notes WHERE chain=? AND contract_address=?",
+                (chain, contract_address)
+            ).fetchone()
+            if prev is not None and prev['body_json'] is not None:
+                # A page loaded before the full editor must not turn a formatted Summary back into plain text.
+                conn.rollback()
+                return jsonify({'error': 'this summary now uses the full editor; reload the page to edit it'}), 409
+            if prev is not None and prev['note'] != note:
+                # Keep the earlier Summary text (committed with the change below).
+                _note_revision(conn, 'spot_summary', chain + ' ' + contract_address, prev['note'], 'edit')
+            conn.execute(
+                """INSERT INTO spot_position_notes (chain, contract_address, note)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(chain, contract_address)
+                   DO UPDATE SET note=excluded.note, updated_at=CURRENT_TIMESTAMP""",
+                (chain, contract_address, note)
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT chain, contract_address, note, updated_at "
+                "FROM spot_position_notes WHERE chain=? AND contract_address=?",
+                (chain, contract_address)
+            ).fetchone()
+        finally:
+            conn.close()
         return jsonify(dict(row))
     except Exception as e:
         print(traceback.format_exc(), flush=True)
@@ -16118,6 +16269,21 @@ def api_watchlist_check(key):
 _WATCH_IMG_RE = re.compile(r"/api/note-images/([1-9][0-9]{0,9})")
 
 
+def _spot_note_image_ids(conn):
+    """Landing 88: every stored-image id a Spot note names - the Summary and dated-update documents (hidden updates
+    included: a delete only hides them) and the earlier versions kept in note_revisions. A reference is any
+    /api/note-images/<id> written in the stored document, so a doubtful case keeps the image. None of these notes
+    can be deleted by a Watch List or Notes tab delete, so for _watch_delete_plan they always count as 'another
+    page' - an image a Spot note uses is never freed."""
+    ids = set()
+    for sql in ("SELECT body_json FROM spot_position_notes WHERE body_json IS NOT NULL",
+                "SELECT body_json FROM spot_note_updates WHERE body_json IS NOT NULL",
+                "SELECT old_json FROM note_revisions WHERE old_json IS NOT NULL"):
+        for r in conn.execute(sql):
+            ids |= {int(x) for x in _WATCH_IMG_RE.findall(r[0] or "")}
+    return ids
+
+
 def _watch_image_stats(conn, ids):
     """{"count", "bytes"} of the stored images among ids (an id that is not stored counts for nothing)."""
     ids = sorted(ids)
@@ -16150,7 +16316,7 @@ def _watch_delete_plan(conn, key, keep=frozenset()):
     images its note versions refer to), "frees" (the part of those no note on any other page refers to and that
     is not in `keep`: what a delete removes), "kept_for_drafts" (images only `keep` saves), "free_ids"}. Every saved version of every note counts as a reference, an old version
     included; a reference is any /api/note-images/<id> written in a version's stored text, so a doubtful case
-    keeps the image."""
+    keeps the image. Landing 88: Spot notes count as another page too (_spot_note_image_ids)."""
     mine, others, versions = set(), set(), 0
     for r in conn.execute("SELECT page, body_json FROM page_notes"):
         ids = {int(x) for x in _WATCH_IMG_RE.findall(r["body_json"] or "")}
@@ -16159,6 +16325,7 @@ def _watch_delete_plan(conn, key, keep=frozenset()):
             mine |= ids
         else:
             others |= ids
+    others |= _spot_note_image_ids(conn)      # Landing 88: Spot notes (and their old versions) keep their images
     unshared = mine - others
     free_ids = sorted(unshared - set(keep))
     return {"versions": versions, "images": _watch_image_stats(conn, mine),

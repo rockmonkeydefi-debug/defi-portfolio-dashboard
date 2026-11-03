@@ -77,9 +77,10 @@ def utc(s):
 def test_tables_and_indexes_exist_and_init_is_idempotent(db):
     portfolio_db.init_db()                                   # second run: no error, no change
     cols = lambda t: [r["name"] for r in db.execute(f"PRAGMA table_info({t})")]
+    # body_json / old_json: Landing 88 (the editor document of a note; NULL = plain text), by migration.
     assert cols("spot_note_updates") == ["id", "chain", "contract_address", "body",
-                                         "created_at", "edited_at", "deleted_at", "trade_id"]
-    assert cols("note_revisions") == ["id", "kind", "ref", "old_text", "action", "revised_at"]
+                                         "created_at", "edited_at", "deleted_at", "trade_id", "body_json"]
+    assert cols("note_revisions") == ["id", "kind", "ref", "old_text", "action", "revised_at", "old_json"]
     idx = {r["name"] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
     assert {"idx_spot_note_updates_position", "idx_note_revisions_ref"} <= idx
 

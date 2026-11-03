@@ -344,8 +344,13 @@ def _note_revisions_add_kinds(conn):
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("DROP TABLE IF EXISTS note_revisions_8c2")
         conn.execute(f"CREATE TABLE note_revisions_8c2 (\n            {NOTE_REVISIONS_COLUMNS}\n        )")
-        conn.execute("INSERT INTO note_revisions_8c2 (id, kind, ref, old_text, action, revised_at) "
-                     "SELECT id, kind, ref, old_text, action, revised_at FROM note_revisions ORDER BY id")
+        # Landing 88: old_json (the editor document an edited Spot note had) is copied when the table has it.
+        has_json = any(c[1] == "old_json" for c in conn.execute("PRAGMA table_info(note_revisions)"))
+        if has_json:
+            conn.execute("ALTER TABLE note_revisions_8c2 ADD COLUMN old_json TEXT")
+        extra = ", old_json" if has_json else ""
+        conn.execute(f"INSERT INTO note_revisions_8c2 (id, kind, ref, old_text, action, revised_at{extra}) "
+                     f"SELECT id, kind, ref, old_text, action, revised_at{extra} FROM note_revisions ORDER BY id")
         old_n = conn.execute("SELECT COUNT(*) FROM note_revisions").fetchone()[0]
         new_n = conn.execute("SELECT COUNT(*) FROM note_revisions_8c2").fetchone()[0]
         if old_n != new_n:
@@ -1864,6 +1869,19 @@ def init_db():
         # are gone, and the key is never used again); every other row, and
         # every row written before Landing 83, reads 0.
         ("note_tabs", "deleted", "INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1))"),
+        # Landing 88 (Nov 2): Spot notes in the Notes page editor. body_json is
+        # the editor document (Quill Delta JSON, as page_notes.body_json) of a
+        # Spot Summary / dated update; NULL = the text was written before the
+        # full editor and lives only in the plain column (note / body), which
+        # stays the plain-text mirror of every save either way. old_json is the
+        # document an edited or deleted note had before the change (NULL for
+        # plain text). The stored-image scan (_watch_delete_plan) reads all
+        # three, so an image a Spot note uses is never freed by a Watch List
+        # or Notes tab delete. (_note_revisions_add_kinds copies old_json when
+        # the table has it.)
+        ("spot_position_notes", "body_json", "TEXT"),
+        ("spot_note_updates", "body_json", "TEXT"),
+        ("note_revisions", "old_json", "TEXT"),
     ]
     for table, col, col_type in migrations:
         try:
