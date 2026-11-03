@@ -103,6 +103,16 @@
      editor keeps that line at its top while images above it load
      (pnKeepAnchor). From the top of the note it opens as before.
 
+   - Landing 88: the Spot page's Summary (and, next, its dated updates) use this
+     panel with an io prop instead of a page key's routes: io.get() answers like
+     GET /api/page-notes/<page> ({status, data: {id, delta, empty, saved_at}}),
+     io.put(delta, baseId) like the PUT ({status, data}, 409 with data.current),
+     so drafts, conflicts, images, tables and the read view are the same code.
+     `page` is then only a key for pnDrafts / pnUploads (spotjournal.js builds
+     it); an io note may hold images, and a draft's images are protected from a
+     Watch List or Notes tab delete (wlDraftImageIds reads every pnDrafts entry).
+     emptyText replaces "No notes yet." in the read view.
+
    Loaded before static/notebook.js and static/spotpnl.js (templates/index.html). Every top-level name
    here starts with pn / PN / PageNotes: Babel turns top-level declarations
    into shared globals, so a name used in another static/*.js file would be
@@ -1828,7 +1838,7 @@ function pnKeepAnchor(quill, blot) {
 // variant 'page' (Landing 24, the Notes page): the note is the page, so the
 // read view shows all of it (no "Show all") and the editor is taller
 // (.pn-panel--page in style.css). Without it (the Spot panel) nothing changes.
-function PageNotesPanel({ page, hideValues, label, variant }) {
+function PageNotesPanel({ page, hideValues, label, variant, io, emptyText }) {
   const full = variant === 'page';
   const [load, setLoad] = usePNState({ status: 'loading', error: false });
   const [note, setNote] = usePNState(null);
@@ -1848,7 +1858,7 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
   const [hint, setHint] = usePNState('');
   const [cellInfo, setCellInfo] = usePNState(null);            // pnCellInfo of the cursor's cell
   const [imgSel, setImgSel] = usePNState(null);                // Landing 33: the selected image {index, width, natural}
-  const imagesOk = pnImagesAllowed(page);                       // Landing 32: the Notes page tabs
+  const imagesOk = pnImagesAllowed(page) || !!io;               // Landing 32: the Notes page tabs (Landing 88: and a note with an io)
   const [uploading, setUploading] = usePNState(0);             // images being prepared or uploaded
   const [usage, setUsage] = usePNState(null);                  // the server's image storage use
   const hostRef = usePNRef(null);
@@ -1876,7 +1886,7 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
 
   function loadNote() {
     setLoad(prev => ({ ...prev, status: prev.status === 'ok' ? 'ok' : 'loading', error: false }));
-    pnRequest('GET', '/api/page-notes/' + page).then(res => {
+    (io ? io.get() : pnRequest('GET', '/api/page-notes/' + page)).then(res => {
       if (!res) return;
       if (res.status === 200 && res.data) { setNote(res.data); setLoad({ status: 'ok', error: false }); }
       else setLoad(prev => ({ status: prev.status === 'ok' ? 'ok' : 'error', error: true }));
@@ -2635,7 +2645,7 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
     savingRef.current = true;
     setError('');
     const sent = pnDrafts[page];
-    const res = await pnRequest('PUT', '/api/page-notes/' + page, { delta, base_id: baseId });
+    const res = io ? await io.put(delta, baseId) : await pnRequest('PUT', '/api/page-notes/' + page, { delta, base_id: baseId });
     setSaving(false);
     savingRef.current = false;
     if (!res) return;
@@ -2706,7 +2716,7 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
       <button type="button" className="pn-textbtn" onClick={loadNote}>Try again</button></div>;
   } else if (mode === 'read') {
     if (!note || note.empty) {
-      body = <div className="pn-muted">No notes yet.</div>;
+      body = <div className="pn-muted">{emptyText || 'No notes yet.'}</div>;
     } else {
       const clamp = !full && !expanded && tall;
       body = <React.Fragment>
@@ -2866,5 +2876,6 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
 }
 
 window.PageNotesPanel = PageNotesPanel;
+window.PageNotesRead = PageNotesRead;        // Landing 88: the read view alone (a Spot Summary in History)
 window.PageNotesHasDraft = pnHasDraft;
 window.PageNotesShowPages = pnShowPages;

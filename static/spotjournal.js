@@ -9,6 +9,13 @@
    before one, and the text inside does not start or end with a space - so
    2*3*4 and ***x*** stay plain text.
 
+   Landing 88: the Summary is written in the Notes page editor (static/pagenotes.js,
+   PageNotesPanel with an io prop; SJSummary below). A Summary saved there is a
+   document (GET / PUT /api/spot/position-notes with {delta, base_id}) with images,
+   tables and colour; one written before still reads as the markers above until you
+   save it in the editor (sjToDelta opens it with its bold, italic and bullets).
+   The dated updates keep the textarea editor until Landing 89.
+
    Loaded before static/spotpnl.js (templates/index.html). Every top-level name
    here starts with sj / SJ / SpotJournal: Babel turns top-level declarations
    into shared globals, so a name used in another static/*.js file would be
@@ -271,17 +278,73 @@ function SJEditor({ value, onChange, onSubmit, onEscape, label, placeholder, dis
   </div>;
 }
 
+// -- The Summary in the Notes page editor (Landing 88) --------------------
+
+const SJ_SUMMARY_EMPTY = "No summary yet. Use it for what doesn't change day to day: where it's held, why you own it.";
+
+// A Summary written before the full editor (the markers above) as an editor document: **bold** and *italic* become
+// formats and "- " lines become bullets. Nothing is saved by this: it is what the editor opens with, and a Summary
+// is converted for good only when you save it there.
+function sjToDelta(text) {
+  const ops = [];
+  sjParseNote(text).forEach(line => {
+    line.segs.forEach(sg => {
+      if (!sg.t) return;
+      ops.push(sg.b ? { insert: sg.t, attributes: { bold: true } }
+        : sg.i ? { insert: sg.t, attributes: { italic: true } } : { insert: sg.t });
+    });
+    ops.push(line.kind === 'bullet' ? { insert: '\n', attributes: { list: 'bullet' } } : { insert: '\n' });
+  });
+  return { ops: ops.length ? ops : [{ insert: '\n' }] };
+}
+
+// The server's Summary view with a document in it: text written before the full editor is converted (sjToDelta).
+function sjSummaryView(v) {
+  return v && v.legacy && !v.delta ? { ...v, delta: sjToDelta(v.text) } : v;
+}
+
+// The Summary of one position: the Notes page editor with the Summary routes behind it. The panel keeps the draft
+// (pnDrafts, key 'spot-summary:<scope>:<position key>'), the conflict prompt and the images; onSaved(text, delta) tells
+// the page what was saved (the plain-text mirror for the row's tooltip, the document for History). scope tells apart
+// panels of ONE position that are on screen together (History shows the position's Summary under every closed trade):
+// each has its own draft and its own uploads, so one panel's editor can never open, overwrite or lose the images of
+// another's. The Open positions row has one panel per position (no scope).
+function SJSummary({ chain, contract_address, symbol, scope, onSaved }) {
+  const Panel = window.PageNotesPanel;
+  if (!Panel) return <div style={{ fontSize: 13, color: 'var(--fail)' }}>The notes editor didn't load. Refresh to try again.</div>;
+  const query = '?chain=' + encodeURIComponent(chain) + '&contract_address=' + encodeURIComponent(contract_address);
+  const io = {
+    async get() {
+      const res = await pnRequest('GET', '/api/spot/position-notes/view' + query);
+      if (res && res.status === 200) res.data = sjSummaryView(res.data);
+      return res;
+    },
+    async put(delta, baseId) {
+      const res = await pnRequest('PUT', '/api/spot/position-notes', { chain, contract_address, delta, base_id: baseId });
+      if (res && res.status === 200 && res.data && onSaved) onSaved(res.data.text, res.data.delta);
+      if (res && res.status === 409 && res.data && res.data.current) res.data = { ...res.data, current: sjSummaryView(res.data.current) };
+      return res;
+    },
+  };
+  return <div className="sj-summary">
+    <Panel page={'spot-summary:' + (scope || 'open') + ':' + chain + ' ' + contract_address} label={'Summary for ' + symbol} variant="page" io={io}
+      emptyText={SJ_SUMMARY_EMPTY} />
+  </div>;
+}
+
 // ── The journal ─────────────────────────────────────────────────────────────
 
 function sjTrimEnd(s) { return String(s || '').replace(/\s+$/, ''); }
 
 // Props: row (a /api/spot/pnl row with a "chain address" position_key),
 // updates (this position's updates, newest first), notesError (the updates
-// list failed to load), onSummarySaved(key, note), onUpdatesChanged(key, fn),
+// list failed to load), onSummarySaved(key, note, delta) (Landing 88: the saved
+// plain text and document), onUpdatesChanged(key, fn), scope (Landing 88: tells
+// apart journals of one position shown together; History passes the trade),
 // draft / onDraftChange (the composer draft, kept by the page until reload),
 // composing / setComposing (composer open, kept by the page).
 function SpotJournal({ row, updates, notesError, onSummarySaved, onUpdatesChanged, draft, onDraftChange,
-                       composing, setComposing }) {
+                       composing, setComposing, scope }) {
   const key = row.position_key;
   // position_key is chain and contract_address joined by one literal space.
   // Split on the FIRST space and never change case (Solana addresses are case-sensitive).
@@ -289,12 +352,7 @@ function SpotJournal({ row, updates, notesError, onSummarySaved, onUpdatesChange
   const chain = key.slice(0, sep);
   const contract_address = key.slice(sep + 1);
   const symbol = String(row.symbol || '').toUpperCase();
-  const summary = row.note || '';
 
-  const [sumEditing, setSumEditing] = useSJState(false);
-  const [sumDraft, setSumDraft] = useSJState('');
-  const [sumBusy, setSumBusy] = useSJState(false);
-  const [sumError, setSumError] = useSJState('');
   const [addBusy, setAddBusy] = useSJState(false);
   const [addError, setAddError] = useSJState('');
   const [editId, setEditId] = useSJState(null);
@@ -306,19 +364,6 @@ function SpotJournal({ row, updates, notesError, onSummarySaved, onUpdatesChange
   const [deleteError, setDeleteError] = useSJState('');
 
   const failed = d => d === undefined || (d && d.error);
-
-  async function saveSummary() {
-    if (sumBusy) return;
-    const note = sjTrimEnd(sumDraft);
-    if (note === summary) { setSumEditing(false); setSumError(''); return; }
-    setSumBusy(true);
-    try {
-      const d = await api('/api/spot/position-notes', { method: 'PUT', body: JSON.stringify({ chain, contract_address, note }) });
-      if (failed(d)) setSumError(extractApiErrorMessage(d));
-      else { setSumError(''); setSumEditing(false); onSummarySaved(key, note); }
-    } catch (err) { setSumError(extractApiErrorMessage(err)); }
-    finally { setSumBusy(false); }
-  }
 
   async function addUpdate() {
     const body = sjTrimEnd(draft);
@@ -373,30 +418,9 @@ function SpotJournal({ row, updates, notesError, onSummarySaved, onUpdatesChange
   const count = updates.length === 1 ? '1 update' : updates.length + ' updates';
 
   return <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-    {/* Summary */}
-    <div className="spot-j75" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
-      <span style={SJ_SECTION}>Summary</span>
-      {!sumEditing && <button type="button" className="tv-btn" style={SJ_SMALL_BTN}
-        aria-label={'Edit summary for ' + symbol}
-        onClick={() => { setSumDraft(summary); setSumError(''); setSumEditing(true); }}>Edit</button>}
-    </div>
-    {sumEditing ? <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-        <SJEditor value={sumDraft} onChange={setSumDraft} onSubmit={saveSummary}
-          onEscape={() => { setSumEditing(false); setSumError(''); }}
-          label={'Summary for ' + symbol} disabled={sumBusy}
-          placeholder="What doesn't change day to day: where it's held, why you own it." />
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-          <button type="button" className="tv-btn primary" style={SJ_SMALL_BTN}
-            disabled={sumBusy || sjTrimEnd(sumDraft) === summary} onClick={saveSummary}>{sumBusy ? 'Saving…' : 'Save'}</button>
-          <button type="button" className="tv-btn" style={SJ_SMALL_BTN} disabled={sumBusy}
-            onClick={() => { setSumEditing(false); setSumError(''); }}>Cancel</button>
-          <span style={{ fontSize: 12, color: 'var(--text3)' }}>Ctrl+Enter to save · Esc to cancel</span>
-        </div>
-        {errLine(sumError)}
-      </div>
-      : summary.trim()
-        ? <div className="spot-j75"><SJNoteText text={summary} /></div>
-        : <div style={{ fontSize: 13, color: 'var(--text3)' }}>No summary yet. Use it for what doesn't change day to day: where it's held, why you own it.</div>}
+    {/* Summary (Landing 88: the Notes page editor) */}
+    <SJSummary key={key} chain={chain} contract_address={contract_address} symbol={symbol} scope={scope}
+      onSaved={(text, delta) => onSummarySaved(key, text, delta)} />
 
     {/* Updates */}
     <div className="spot-j75" style={{ borderTop: SJ_LINE_STRONG, paddingTop: 12, display: 'flex', alignItems: 'center',
@@ -472,6 +496,7 @@ function SpotJournal({ row, updates, notesError, onSummarySaved, onUpdatesChange
 window.SpotJournal = SpotJournal;
 window.SJNoteText = SJNoteText;
 window.sjParseNote = sjParseNote;
+window.sjToDelta = sjToDelta;
 window.sjInline = sjInline;
 window.sjPlain = sjPlain;
 window.sjParseTime = sjParseTime;
