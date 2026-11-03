@@ -14590,10 +14590,19 @@ def _spot_note_update_out(r):
     key /api/spot/pnl emits for the same position. trade_id (Landing 2b) is
     the trade a moved Trade Log note belongs to, else None; only the one-time
     move of Oct 4 set it (that route has since been removed), so updates
-    added on the Spot page never carry one."""
+    added on the Spot page never carry one.
+
+    Landing 89: "body" stays the plain-text mirror of every save; "delta" is
+    the editor document (None for text written before the full editor),
+    "version" the token the editor's conflict check sends back as base_id (the
+    Summary's _spot_note_token, a hash of what is stored) and "legacy" says the
+    update is plain text with no document."""
+    body_json = r["body_json"]
     return {"id": r["id"], "chain": r["chain"], "contract_address": r["contract_address"],
             "position_key": r["chain"] + " " + r["contract_address"], "body": r["body"],
-            "created_at": r["created_at"], "edited_at": r["edited_at"], "trade_id": r["trade_id"]}
+            "created_at": r["created_at"], "edited_at": r["edited_at"], "trade_id": r["trade_id"],
+            "version": _spot_note_token(r["body"], body_json),
+            "delta": json.loads(body_json) if body_json else None, "legacy": body_json is None}
 
 
 def _spot_note_update_body(data):
@@ -14607,11 +14616,40 @@ def _spot_note_update_body(data):
     return body, None
 
 
+def _spot_update_rich(data):
+    """Landing 89: a dated update written in the Notes page editor. data = {"delta": the editor document, ...}.
+    Returns (body_json, body_text, image_ids, None) or (None, None, None, error message). The document goes
+    through _page_note_check with images allowed (the Notes page's 10,000 characters); an update needs
+    something to show, so a document whose plain-text mirror is blank (one empty table, say) is refused, as a
+    blank body always was. body_text is the plain-text mirror stored in "body" (each image reads "[image]")."""
+    if 'body' in data:
+        return None, None, None, 'send either body or delta, not both'
+    body_json, body_text, err = _page_note_check(data.get('delta'), images_ok=True)
+    if err:
+        return None, None, None, err
+    if not body_text.strip():
+        return None, None, None, 'body must be a non-empty string'
+    return body_json, body_text, _page_note_image_ids(body_json), None
+
+
+_SPOT_UPDATE_IMAGE_ERROR = "an image in this note isn't stored on the server; remove it and paste it again"
+
+
+def _spot_update_images_stored(conn, image_ids):
+    """True when every id in image_ids is a stored note image (read inside the caller's write lock)."""
+    if not image_ids:
+        return True
+    found = {r[0] for r in conn.execute(
+        f"SELECT id FROM note_images WHERE id IN ({','.join('?' * len(image_ids))})", image_ids)}
+    return len(found) == len(image_ids)
+
+
 @app.route('/api/spot/note-updates', methods=['GET'])
 def api_spot_note_updates_list():
     """Dated updates that are not deleted, newest first (ties: newest id
     first). ?chain=&contract_address= narrows to one position; give both or
-    neither. Read-only."""
+    neither. Read-only. Landing 89: each row also carries "delta", "version"
+    and "legacy" (see _spot_note_update_out)."""
     chain = (request.args.get('chain') or '').strip()
     contract_address = (request.args.get('contract_address') or '').strip()
     if bool(chain) != bool(contract_address):
@@ -14638,7 +14676,10 @@ def api_spot_note_updates_list():
 def api_spot_note_updates_add():
     """Add a dated update to one (chain, contract_address) position, stamped
     with the server's UTC time. Same chain / contract_address rules as the
-    Summary (no symbol-only positions). 201 with the stored update."""
+    Summary (no symbol-only positions). 201 with the stored update.
+    Landing 89: {"delta": the editor document} (images allowed, every image
+    must be stored) is the way the page writes one; the plain {"body"} of
+    Landing 2 still works for a page loaded before the full editor."""
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         data = {}
@@ -14648,18 +14689,37 @@ def api_spot_note_updates_add():
     contract_address = data.get('contract_address')
     if not isinstance(contract_address, str) or not contract_address.strip():
         return jsonify({'error': 'contract_address is required'}), 400
-    body, err = _spot_note_update_body(data)
+    body_json, image_ids = None, []
+    if 'delta' in data:
+        body_json, body, image_ids, err = _spot_update_rich(data)
+    else:
+        body, err = _spot_note_update_body(data)
     if err:
         return jsonify({'error': err}), 400
     try:
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
         try:
-            cur = conn.execute(
-                "INSERT INTO spot_note_updates (chain, contract_address, body, created_at) VALUES (?, ?, ?, ?)",
-                (chain.strip(), contract_address.strip(), body, _note_now()))
+            # One writer at a time: the images are checked and the update written under the same lock.
+            conn.execute("BEGIN IMMEDIATE")
+            if not _spot_update_images_stored(conn, image_ids):
+                conn.rollback()
+                return jsonify({'error': _SPOT_UPDATE_IMAGE_ERROR}), 400
+            if body_json is None:
+                # Plain text (a page loaded before the full editor): the same four columns as before Landing 89.
+                cur = conn.execute(
+                    "INSERT INTO spot_note_updates (chain, contract_address, body, created_at) VALUES (?, ?, ?, ?)",
+                    (chain.strip(), contract_address.strip(), body, _note_now()))
+            else:
+                cur = conn.execute(
+                    "INSERT INTO spot_note_updates (chain, contract_address, body, created_at, body_json) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (chain.strip(), contract_address.strip(), body, _note_now(), body_json))
             conn.commit()
             row = conn.execute("SELECT * FROM spot_note_updates WHERE id = ?", (cur.lastrowid,)).fetchone()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
         return jsonify(_spot_note_update_out(row)), 201
@@ -14672,21 +14732,62 @@ def api_spot_note_updates_add():
 def api_spot_note_updates_edit(update_id):
     """Replace one update's text. The same text again changes nothing; new
     text keeps the earlier text in note_revisions and sets edited_at. The
-    original created_at never changes. 404 for an unknown or deleted id."""
+    original created_at never changes. 404 for an unknown or deleted id.
+
+    Landing 89: {"delta": the editor document, "base_id": the "version" the
+    edit started from} is the way the page edits one. A stale base_id (the
+    update was saved from another tab or device since) is a 409 with the
+    stored update as "current"; a document equal to the stored one writes
+    nothing ("changed": false); the earlier text and document go to
+    note_revisions in the same transaction. A plain {"body"} over an update
+    that already has a document is a 409 (a page loaded before the full
+    editor must not turn it back into plain text). Both ways read the stored
+    update and write under one write lock."""
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         data = {}
-    body, err = _spot_note_update_body(data)
+    rich = 'delta' in data
+    base_id = data.get('base_id')
+    if rich:
+        if base_id is not None and not (isinstance(base_id, str) and re.fullmatch(r"[0-9a-f]{16}", base_id)):
+            return jsonify({'error': 'base_id must be a version token or null'}), 400
+        body_json, body, image_ids, err = _spot_update_rich(data)
+    else:
+        body, err = _spot_note_update_body(data)
     if err:
         return jsonify({'error': err}), 400
     try:
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
         try:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM spot_note_updates WHERE id = ? AND deleted_at IS NULL",
                                (update_id,)).fetchone()
             if row is None:
+                conn.rollback()
                 return jsonify({'error': 'update not found'}), 404
+            if rich:
+                if not _spot_update_images_stored(conn, image_ids):
+                    conn.rollback()
+                    return jsonify({'error': _SPOT_UPDATE_IMAGE_ERROR}), 400
+                if base_id != _spot_note_token(row['body'], row['body_json']):
+                    conn.rollback()
+                    return jsonify({'error': 'this update was saved from another tab or device after you '
+                                             'started editing', 'current': _spot_note_update_out(row)}), 409
+                if row['body_json'] == body_json and row['body'] == body:
+                    conn.rollback()
+                    return jsonify({**_spot_note_update_out(row), 'changed': False})
+                now = _note_now()
+                # Keep the earlier text and document, committed with the change below.
+                _note_revision(conn, 'spot_update', update_id, row['body'], 'edit', now, old_json=row['body_json'])
+                conn.execute("UPDATE spot_note_updates SET body = ?, body_json = ?, edited_at = ? WHERE id = ?",
+                             (body, body_json, now, update_id))
+                conn.commit()
+                row = conn.execute("SELECT * FROM spot_note_updates WHERE id = ?", (update_id,)).fetchone()
+                return jsonify({**_spot_note_update_out(row), 'changed': True})
+            if row['body_json'] is not None:
+                conn.rollback()
+                return jsonify({'error': 'this update now uses the full editor; reload the page to edit it'}), 409
             if body != row['body']:
                 now = _note_now()
                 _note_revision(conn, 'spot_update', update_id, row['body'], 'edit', now)
@@ -14694,6 +14795,11 @@ def api_spot_note_updates_edit(update_id):
                              (body, now, update_id))
                 conn.commit()
                 row = conn.execute("SELECT * FROM spot_note_updates WHERE id = ?", (update_id,)).fetchone()
+            else:
+                conn.rollback()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
         return jsonify(_spot_note_update_out(row))
@@ -14705,19 +14811,27 @@ def api_spot_note_updates_edit(update_id):
 @app.route('/api/spot/note-updates/<int:update_id>', methods=['DELETE'])
 def api_spot_note_updates_delete(update_id):
     """Hide one update: sets deleted_at and keeps its text in note_revisions.
-    The row itself is never removed. 404 for an unknown or already deleted id."""
+    The row itself is never removed. 404 for an unknown or already deleted id.
+    Landing 89: the document an update had (if any) is kept in the revision
+    too, and the read and the write happen under one write lock, so an edit
+    and a delete racing each other cannot both succeed."""
     try:
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
         try:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM spot_note_updates WHERE id = ? AND deleted_at IS NULL",
                                (update_id,)).fetchone()
             if row is None:
+                conn.rollback()
                 return jsonify({'error': 'update not found'}), 404
             now = _note_now()
-            _note_revision(conn, 'spot_update', update_id, row['body'], 'delete', now)
+            _note_revision(conn, 'spot_update', update_id, row['body'], 'delete', now, old_json=row['body_json'])
             conn.execute("UPDATE spot_note_updates SET deleted_at = ? WHERE id = ?", (now, update_id))
             conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
         return jsonify({'id': update_id, 'deleted_at': now})
