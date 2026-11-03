@@ -24,7 +24,9 @@ const ARCHIVE_SUBNAV_ITEMS = [
 // Screens and render branches are left intact — unhide by removing the id.
 //   aibrief — AI Brief, unused, hidden Sep 2026
 //   tt      — Trading Tools, unused, hidden Sep 2026
-var HIDDEN_TABS = ['aibrief', 'tt'];
+//   maxfi, pl, scout, actionplan, checklist - the MaxFi section, no longer
+//           used, hidden Nov 2026 (Landing 91; the backend keeps running)
+var HIDDEN_TABS = ['aibrief', 'tt', 'maxfi', 'pl', 'scout', 'actionplan', 'checklist'];
 
 function isHiddenTab(tabId) {
   if (!tabId) return false;
