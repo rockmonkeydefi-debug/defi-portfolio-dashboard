@@ -113,6 +113,14 @@
      Watch List or Notes tab delete (wlDraftImageIds reads every pnDrafts entry).
      emptyText replaces "No notes yet." in the read view.
 
+   - Landing 89: the dated updates use the same panel. Two more optional props:
+     startInEdit opens the panel in edit mode (a new update's composer, an
+     update whose Edit was pressed in the journal's own row), and onClosed(note)
+     is called whenever the editor closes: with the saved note (or, after
+     "Use theirs" on a conflict, the stored one), or null when it was cancelled,
+     discarded or had nothing to keep. The page then removes the composer or
+     shows the panel read-only again.
+
    Loaded before static/notebook.js and static/spotpnl.js (templates/index.html). Every top-level name
    here starts with pn / PN / PageNotes: Babel turns top-level declarations
    into shared globals, so a name used in another static/*.js file would be
@@ -1838,11 +1846,11 @@ function pnKeepAnchor(quill, blot) {
 // variant 'page' (Landing 24, the Notes page): the note is the page, so the
 // read view shows all of it (no "Show all") and the editor is taller
 // (.pn-panel--page in style.css). Without it (the Spot panel) nothing changes.
-function PageNotesPanel({ page, hideValues, label, variant, io, emptyText }) {
+function PageNotesPanel({ page, hideValues, label, variant, io, emptyText, startInEdit, onClosed }) {
   const full = variant === 'page';
   const [load, setLoad] = usePNState({ status: 'loading', error: false });
   const [note, setNote] = usePNState(null);
-  const [mode, setMode] = usePNState(() => (pnDrafts[page] ? 'edit' : 'read'));
+  const [mode, setMode] = usePNState(() => (pnDrafts[page] || startInEdit ? 'edit' : 'read'));
   const [restored, setRestored] = usePNState(() => !!(pnDrafts[page] && pnDrafts[page].dirty));
   const [quillState, setQuillState] = usePNState('idle');      // idle | loading | ready | failed
   const [saving, setSaving] = usePNState(false);
@@ -2615,6 +2623,7 @@ function PageNotesPanel({ page, hideValues, label, variant, io, emptyText }) {
     setConfirmDiscard(false);
     setError('');
     setTimeout(() => { if (editBtnRef.current) editBtnRef.current.focus(); }, 0);
+    if (onClosed) onClosed(newNote || null);      // Landing 89: a dated update's panel is told the editor closed (saved note, or null)
   }
 
   async function save(overrideBase) {

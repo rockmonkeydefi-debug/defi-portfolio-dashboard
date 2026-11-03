@@ -14,18 +14,21 @@
    document (GET / PUT /api/spot/position-notes with {delta, base_id}) with images,
    tables and colour; one written before still reads as the markers above until you
    save it in the editor (sjToDelta opens it with its bold, italic and bullets).
-   The dated updates keep the textarea editor until Landing 89.
+
+   Landing 89: the dated updates are written in the same editor: each update is a
+   panel of its own (SJUpdateDoc), a new one is composed in a panel too (SJNewUpdate),
+   both through the update routes (GET / POST / PUT /api/spot/note-updates with
+   {delta, base_id}); an update written before still reads as the markers above until
+   you save it in the editor.
 
    Loaded before static/spotpnl.js (templates/index.html). Every top-level name
    here starts with sj / SJ / SpotJournal: Babel turns top-level declarations
    into shared globals, so a name used in another static/*.js file would be
    silently overwritten. */
 
-const { useState: useSJState, useEffect: useSJEffect, useRef: useSJRef } = React;
+const { useState: useSJState } = React;
 
-const SJ_MAX = 2000;            // characters per Summary and per update (SPOT_NOTE_MAX on the server)
 const SJ_PREVIEW_MAX = 300;     // ✎ hover preview, per part
-const SJ_EDITOR_ROWS = 8;
 const SJ_BULLET_RE = /^(\s*)([-•*])\s+(.*)$/;
 const SJ_LINE = '2px solid rgba(255,255,255,0.25)';          // between updates
 const SJ_LINE_STRONG = '2px solid rgba(255,255,255,0.4)';    // between the Summary and the updates
@@ -146,138 +149,6 @@ function sjShortAge(ms) {
   return Math.floor(hr / 24) + 'd';
 }
 
-// ── Editor ──────────────────────────────────────────────────────────────────
-
-// The line range [start, end) around positions a..b of text.
-function sjLineRange(text, a, b) {
-  const start = text.lastIndexOf('\n', a - 1) + 1;
-  let end = text.indexOf('\n', b);
-  if (end === -1) end = text.length;
-  return [start, end];
-}
-
-// Textarea with the B / I / • toolbar and a character counter. Keys:
-// Ctrl/Cmd+B bold, Ctrl/Cmd+I italic, Ctrl/Cmd+Enter submit, Esc onEscape,
-// Enter continues a bullet and Enter on an empty bullet ends the list.
-// Edits go through execCommand('insertText') so Ctrl+Z still undoes them;
-// where that is unavailable the value is set directly.
-function SJEditor({ value, onChange, onSubmit, onEscape, label, placeholder, disabled }) {
-  const ref = useSJRef(null);
-  const pendingSel = useSJRef(null);
-
-  useSJEffect(() => {
-    const el = ref.current;
-    if (el && pendingSel.current) {
-      el.setSelectionRange(pendingSel.current[0], pendingSel.current[1]);
-      pendingSel.current = null;
-    }
-  });
-
-  // Replace [a, b) with text, then select [selA, selB).
-  function replace(a, b, text, selA, selB) {
-    const el = ref.current;
-    if (!el || (a === b && text === '')) return;
-    const cur = el.value;
-    if (cur.length - (b - a) + text.length > SJ_MAX) return;   // would pass the limit: do nothing
-    el.focus();
-    el.setSelectionRange(a, b);
-    let ok = false;
-    try {
-      ok = text === '' ? document.execCommand('delete', false) : document.execCommand('insertText', false, text);
-    } catch (_e) { ok = false; }
-    if (!ok || el.value === cur) {
-      onChange(cur.slice(0, a) + text + cur.slice(b));
-      pendingSel.current = [selA, selB];
-      return;
-    }
-    el.setSelectionRange(selA, selB);
-  }
-
-  function wrap(marker) {
-    const el = ref.current;
-    if (!el || disabled) return;
-    const a = el.selectionStart;
-    const b = el.selectionEnd;
-    const sel = el.value.slice(a, b);
-    const n = marker.length;
-    replace(a, b, marker + sel + marker, a + n, b + n);
-  }
-
-  function toggleBullets() {
-    const el = ref.current;
-    if (!el || disabled) return;
-    const text = el.value;
-    const caret = el.selectionStart;
-    const collapsed = caret === el.selectionEnd;
-    const [start, end] = sjLineRange(text, el.selectionStart, el.selectionEnd);
-    const lines = text.slice(start, end).split('\n');
-    const all = lines.every(l => SJ_BULLET_RE.test(l));
-    const next = lines.map(l => {
-      if (all) return l.replace(/^(\s*)[-•*]\s+/, '$1');
-      return SJ_BULLET_RE.test(l) ? l : '- ' + l;
-    }).join('\n');
-    if (collapsed && lines.length === 1) {
-      // One line, no selection: keep the caret where it was in the text.
-      const pos = Math.max(start, caret + next.length - (end - start));
-      replace(start, end, next, pos, pos);
-    } else {
-      replace(start, end, next, start, start + next.length);
-    }
-  }
-
-  function onKeyDown(e) {
-    if (e.nativeEvent && e.nativeEvent.isComposing) return;
-    const mod = e.ctrlKey || e.metaKey;
-    if (mod && e.key === 'Enter') { e.preventDefault(); if (onSubmit) onSubmit(); return; }
-    if (e.key === 'Escape') { e.preventDefault(); if (onEscape) onEscape(); return; }
-    if (mod && !e.shiftKey && !e.altKey && (e.key === 'b' || e.key === 'B')) { e.preventDefault(); wrap('**'); return; }
-    if (mod && !e.shiftKey && !e.altKey && (e.key === 'i' || e.key === 'I')) { e.preventDefault(); wrap('*'); return; }
-    if (e.key === 'Enter' && !mod && !e.shiftKey && !e.altKey) {
-      const el = ref.current;
-      const a = el.selectionStart;
-      if (a !== el.selectionEnd) return;
-      const text = el.value;
-      const lineStart = text.lastIndexOf('\n', a - 1) + 1;
-      let lineEnd = text.indexOf('\n', a);
-      if (lineEnd === -1) lineEnd = text.length;
-      const line = text.slice(lineStart, lineEnd);
-      const bm = line.match(SJ_BULLET_RE);
-      const bare = /^\s*[-•*]\s+$/.test(line);
-      if (bare && a === lineEnd) {
-        // Enter on an empty bullet ends the list: remove the marker.
-        e.preventDefault();
-        replace(lineStart, lineEnd, '', lineStart, lineStart);
-        return;
-      }
-      if (bm && a > lineStart + bm[1].length + 1) {
-        e.preventDefault();
-        const insert = '\n' + bm[1] + bm[2] + ' ';
-        replace(a, a, insert, a + insert.length, a + insert.length);
-      }
-    }
-  }
-
-  const tool = (txt, title, onClick, style) => <button type="button" className="tv-btn" title={title} aria-label={title}
-    disabled={disabled} onMouseDown={e => e.preventDefault()} onClick={onClick}
-    style={{ minWidth: 34, minHeight: 32, padding: '2px 10px', fontSize: 14, ...style }}>{txt}</button>;
-  const len = value.length;
-  const countColor = len >= SJ_MAX ? 'var(--fail)' : len >= SJ_MAX - 100 ? 'var(--warn)' : 'var(--text3)';
-
-  return <div className="spot-j75" style={{ display: 'flex', flexDirection: 'column', gap: 6, width: '100%' }}>
-    <div role="toolbar" aria-label={'Formatting for ' + label} style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
-      {tool('B', 'Bold (Ctrl+B)', () => wrap('**'), { fontWeight: 700 })}
-      {tool('I', 'Italic (Ctrl+I)', () => wrap('*'), { fontStyle: 'italic', fontFamily: 'Georgia, serif' })}
-      {tool('•', 'Bullet list', toggleBullets)}
-      <span style={{ flex: 1 }} />
-      <span aria-live="polite" style={{ fontSize: 12, color: countColor }}>{len + ' / ' + SJ_MAX}</span>
-    </div>
-    <textarea ref={ref} className="tv-input" rows={SJ_EDITOR_ROWS} maxLength={SJ_MAX} value={value} autoFocus
-      aria-label={label} placeholder={placeholder} disabled={disabled}
-      onChange={e => onChange(e.target.value)} onKeyDown={onKeyDown}
-      style={{ fontSize: 14, lineHeight: '21px', resize: 'vertical', fontFamily: 'inherit', display: 'block' }} />
-  </div>;
-}
-
 // -- The Summary in the Notes page editor (Landing 88) --------------------
 
 const SJ_SUMMARY_EMPTY = "No summary yet. Use it for what doesn't change day to day: where it's held, why you own it.";
@@ -332,19 +203,87 @@ function SJSummary({ chain, contract_address, symbol, scope, onSaved }) {
   </div>;
 }
 
-// ── The journal ─────────────────────────────────────────────────────────────
+// -- A dated update in the Notes page editor (Landing 89) -----------------
 
-function sjTrimEnd(s) { return String(s || '').replace(/\s+$/, ''); }
+// An update row (as the list, POST and PUT answer) as the editor's note view: {id (the version token), delta, text,
+// saved_at, empty, legacy, row}. An update written before the full editor opens converted (sjToDelta); nothing is
+// saved by this, it is converted for good only when saved in the editor. row is the update itself, so the page can
+// replace its copy when the editor closes with the stored version ("Use theirs" on a conflict).
+function sjUpdateView(u) {
+  if (!u) return u;
+  return { id: u.version, delta: u.delta || sjToDelta(u.body), text: u.body, saved_at: u.edited_at || u.created_at,
+           empty: !String(u.body || '').trim(), legacy: !!u.legacy, row: u };
+}
+
+// One dated update as a Notes page panel. pageKey is the panel's draft key ('spot-update:<scope>:<id>': scope tells
+// apart journals of ONE position that are on screen together, History shows it under every closed trade); editing
+// opens the panel in edit mode (the journal remounts the panel with a new key when its own Edit is pressed). The
+// update's own row (stamp, Edit, Delete) is the journal's; the panel's header shows only while editing.
+// onSaved(update) hands the page the stored update, onClosed(view | null) says the editor closed.
+function SJUpdateDoc({ u, pageKey, stamp, editing, onSaved, onClosed }) {
+  const Panel = window.PageNotesPanel;
+  if (!Panel) return <div role="alert" style={{ fontSize: 13, color: 'var(--fail)' }}>The notes editor didn't load. Refresh to try again.</div>;
+  const io = {
+    async get() { return { status: 200, data: sjUpdateView(u) }; },
+    async put(delta, baseId) {
+      const res = await pnRequest('PUT', '/api/spot/note-updates/' + u.id, { delta, base_id: baseId });
+      if (res && res.status === 200 && res.data) { onSaved(res.data); res.data = sjUpdateView(res.data); }
+      else if (res && res.status === 409 && res.data && res.data.current) res.data = { ...res.data, current: sjUpdateView(res.data.current) };
+      return res;
+    },
+  };
+  return <div className="sj-update">
+    <Panel page={pageKey} label={'Update from ' + stamp} variant="page" io={io} startInEdit={editing} onClosed={onClosed} />
+  </div>;
+}
+
+// The composer of a new update: an empty note that is created, with the server's time, when it is saved. The first
+// save is a POST and closes the composer (onAdded(update) puts the new update in the list, onClosed() removes the
+// composer); Cancel and Esc go through the editor's own discard question.
+function SJNewUpdate({ chain, contract_address, symbol, pageKey, onAdded, onClosed }) {
+  const Panel = window.PageNotesPanel;
+  if (!Panel) return <div role="alert" style={{ fontSize: 13, color: 'var(--fail)' }}>The notes editor didn't load. Refresh to try again.</div>;
+  const io = {
+    async get() { return { status: 200, data: { id: null, delta: null, text: '', saved_at: null, empty: true, legacy: false } }; },
+    async put(delta) {
+      const res = await pnRequest('POST', '/api/spot/note-updates', { chain, contract_address, delta });
+      if (res && res.status === 201 && res.data) {
+        onAdded(res.data);
+        delete pnDrafts[pageKey];      // stored: this draft must never come back (the panel may be gone already, and then nothing else would close it)
+        return { status: 200, data: sjUpdateView(res.data) };
+      }
+      return res;
+    },
+  };
+  return <div className="sj-update">
+    <div style={{ fontSize: 12, color: 'var(--text3)', marginBottom: 6 }}>It is stamped with the date and time when you save it.</div>
+    <Panel page={pageKey} label={'New update for ' + symbol} variant="page" io={io} startInEdit={true} onClosed={() => onClosed()} />
+  </div>;
+}
+
+// After an editor closes the journal's own button is back: give it the focus.
+function sjFocusLater(attr, value) {
+  let tries = 0;
+  const timer = setInterval(() => {
+    const el = document.querySelector('[' + attr + '="' + value + '"]');
+    tries += 1;
+    if (el) { el.focus(); clearInterval(timer); }
+    else if (tries > 30) clearInterval(timer);      // the page re-draws first: wait for the button, for about 1.5 s
+  }, 50);
+}
+
+// ── The journal ─────────────────────────────────────────────────────────────
 
 // Props: row (a /api/spot/pnl row with a "chain address" position_key),
 // updates (this position's updates, newest first), notesError (the updates
 // list failed to load), onSummarySaved(key, note, delta) (Landing 88: the saved
 // plain text and document), onUpdatesChanged(key, fn), scope (Landing 88: tells
 // apart journals of one position shown together; History passes the trade),
-// draft / onDraftChange (the composer draft, kept by the page until reload),
-// composing / setComposing (composer open, kept by the page).
-function SpotJournal({ row, updates, notesError, onSummarySaved, onUpdatesChanged, draft, onDraftChange,
-                       composing, setComposing, scope }) {
+// editing / setEditing(panelKey, open) (Landing 89: the page's map of open
+// editors, keyed by each panel's draft key: the composer and every update
+// being edited stay open across tab switches until the page reloads, as their
+// drafts do).
+function SpotJournal({ row, updates, notesError, onSummarySaved, onUpdatesChanged, editing, setEditing, scope }) {
   const key = row.position_key;
   // position_key is chain and contract_address joined by one literal space.
   // Split on the FIRST space and never change case (Solana addresses are case-sensitive).
@@ -352,55 +291,27 @@ function SpotJournal({ row, updates, notesError, onSummarySaved, onUpdatesChange
   const chain = key.slice(0, sep);
   const contract_address = key.slice(sep + 1);
   const symbol = String(row.symbol || '').toUpperCase();
+  const where = scope || 'open';
+  const open = editing || {};
+  const composeKey = 'spot-update-new:' + where + ':' + key;
+  const composing = !!open[composeKey];
 
-  const [addBusy, setAddBusy] = useSJState(false);
-  const [addError, setAddError] = useSJState('');
-  const [editId, setEditId] = useSJState(null);
-  const [editDraft, setEditDraft] = useSJState('');
-  const [editBusy, setEditBusy] = useSJState(false);
-  const [editError, setEditError] = useSJState('');
   const [confirmId, setConfirmId] = useSJState(null);
   const [deleteBusy, setDeleteBusy] = useSJState(false);
   const [deleteError, setDeleteError] = useSJState('');
 
   const failed = d => d === undefined || (d && d.error);
 
-  async function addUpdate() {
-    const body = sjTrimEnd(draft);
-    if (addBusy || !body.trim()) return;
-    setAddBusy(true);
-    try {
-      const d = await api('/api/spot/note-updates', { method: 'POST', body: JSON.stringify({ chain, contract_address, body }) });
-      if (failed(d)) setAddError(extractApiErrorMessage(d));
-      else {
-        setAddError('');
-        onUpdatesChanged(key, list => [d].concat(list));
-        onDraftChange('');
-        setComposing(false);
-      }
-    } catch (err) { setAddError(extractApiErrorMessage(err)); }
-    finally { setAddBusy(false); }
-  }
-
-  async function saveEdit(u) {
-    const body = sjTrimEnd(editDraft);
-    if (editBusy || !body.trim()) return;
-    if (body === u.body) { setEditId(null); setEditError(''); return; }
-    setEditBusy(true);
-    try {
-      const d = await api('/api/spot/note-updates/' + u.id, { method: 'PUT', body: JSON.stringify({ body }) });
-      if (failed(d)) setEditError(extractApiErrorMessage(d));
-      else {
-        setEditError('');
-        setEditId(null);
-        onUpdatesChanged(key, list => list.map(x => x.id === u.id ? d : x));
-      }
-    } catch (err) { setEditError(extractApiErrorMessage(err)); }
-    finally { setEditBusy(false); }
+  function replaceUpdate(next) {
+    onUpdatesChanged(key, list => list.map(x => x.id === next.id ? next : x));
   }
 
   async function deleteUpdate(u) {
     if (deleteBusy) return;
+    // The Closed tab shows one update under every closed trade of its position: unsaved changes typed in another of
+    // those views (a draft of 'spot-update:<scope>:<id>') would vanish with the update, so refuse until they are dealt with.
+    const unsaved = Object.keys(pnDrafts).filter(k => k.indexOf('spot-update:') === 0 && k.slice(k.lastIndexOf(':') + 1) === String(u.id) && pnDrafts[k].dirty);
+    if (unsaved.length) { setDeleteError('This update has unsaved changes open in another view. Save or discard them there first.'); return; }
     setDeleteBusy(true);
     try {
       const d = await api('/api/spot/note-updates/' + u.id, { method: 'DELETE' });
@@ -429,27 +340,18 @@ function SpotJournal({ row, updates, notesError, onSummarySaved, onUpdatesChange
         <span style={SJ_SECTION}>Updates</span>
         <span style={{ fontSize: 13, color: 'var(--text3)' }}>{notesError ? 'not loaded' : count}</span>
       </div>
-      {!composing && <button type="button" className="tv-btn" style={SJ_SMALL_BTN}
-        aria-label={'Add update for ' + symbol} onClick={() => { setAddError(''); setComposing(true); }}>+ Add update</button>}
+      {!composing && <button type="button" className="tv-btn" style={SJ_SMALL_BTN} data-sj-add={composeKey}
+        aria-label={'Add update for ' + symbol} onClick={() => setEditing(composeKey, true)}>+ Add update</button>}
     </div>
     {notesError && <div role="alert" style={{ color: 'var(--fail)', fontSize: 13 }}>Couldn't load the updates. Refresh to try again.</div>}
-    {composing && <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-      <SJEditor value={draft} onChange={onDraftChange} onSubmit={addUpdate} onEscape={() => setComposing(false)}
-        label={'New update for ' + symbol} disabled={addBusy}
-        placeholder="Add an update. It is stamped with today's date and time when you add it." />
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-        <button type="button" className="tv-btn primary" style={SJ_SMALL_BTN} disabled={addBusy || !draft.trim()}
-          onClick={addUpdate}>{addBusy ? 'Adding…' : 'Add update'}</button>
-        <button type="button" className="tv-btn" style={SJ_SMALL_BTN} disabled={addBusy}
-          onClick={() => setComposing(false)}>Cancel</button>
-        <span style={{ fontSize: 12, color: 'var(--text3)' }}>Cancel and Esc keep your draft until you add it · Ctrl+Enter to add</span>
-      </div>
-      {errLine(addError)}
-    </div>}
+    {composing && <SJNewUpdate chain={chain} contract_address={contract_address} symbol={symbol} pageKey={composeKey}
+      onAdded={added => { onUpdatesChanged(key, list => [added].concat(list)); setEditing(composeKey, false); }}
+      onClosed={() => { setEditing(composeKey, false); sjFocusLater('data-sj-add', composeKey); }} />}
     {updates.map(u => {
       const at = sjParseTime(u.created_at);
       const edited = sjParseTime(u.edited_at);
-      const editing = editId === u.id;
+      const pageKey = 'spot-update:' + where + ':' + u.id;
+      const isEditing = !!open[pageKey];
       const confirming = confirmId === u.id;
       return <div key={u.id} className="spot-j75" style={{ display: 'flex', flexDirection: 'column', gap: 6, paddingTop: 10, borderTop: SJ_LINE }}>
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }}>
@@ -457,11 +359,11 @@ function SpotJournal({ row, updates, notesError, onSummarySaved, onUpdatesChange
           <span style={{ fontSize: 13, color: 'var(--text3)' }}>{sjAgo(at)}</span>
           {isFinite(edited) && <span style={{ fontSize: 13, color: 'var(--text3)' }} title={'Edited ' + sjStamp(edited)}>{'· edited ' + sjAgo(edited)}</span>}
           <span style={{ flex: 1 }} />
-          {!editing && !confirming && <span style={{ display: 'inline-flex', gap: 6 }}>
-            <button type="button" className="tv-btn" style={SJ_SMALL_BTN} aria-label={'Edit update from ' + sjStamp(at)}
-              onClick={() => { setEditId(u.id); setEditDraft(u.body); setEditError(''); setConfirmId(null); }}>Edit</button>
+          {!isEditing && !confirming && <span style={{ display: 'inline-flex', gap: 6 }}>
+            <button type="button" className="tv-btn" style={SJ_SMALL_BTN} aria-label={'Edit update from ' + sjStamp(at)} data-sj-edit={pageKey}
+              onClick={() => { setConfirmId(null); setEditing(pageKey, true); }}>Edit</button>
             <button type="button" className="tv-btn danger" style={SJ_SMALL_BTN} aria-label={'Delete update from ' + sjStamp(at)}
-              onClick={() => { setConfirmId(u.id); setDeleteError(''); setEditId(null); }}>Delete</button>
+              onClick={() => { setConfirmId(u.id); setDeleteError(''); }}>Delete</button>
           </span>}
         </div>
         {confirming && <div role="group" aria-label="Confirm delete" style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
@@ -473,20 +375,10 @@ function SpotJournal({ row, updates, notesError, onSummarySaved, onUpdatesChange
             onClick={() => { setConfirmId(null); setDeleteError(''); }}>Keep</button>
           {errLine(deleteError)}
         </div>}
-        {editing ? <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            <SJEditor value={editDraft} onChange={setEditDraft} onSubmit={() => saveEdit(u)}
-              onEscape={() => { setEditId(null); setEditError(''); }}
-              label={'Edit update from ' + sjStamp(at)} disabled={editBusy} />
-            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-              <button type="button" className="tv-btn primary" style={SJ_SMALL_BTN}
-                disabled={editBusy || !editDraft.trim() || sjTrimEnd(editDraft) === u.body}
-                onClick={() => saveEdit(u)}>{editBusy ? 'Saving…' : 'Save'}</button>
-              <button type="button" className="tv-btn" style={SJ_SMALL_BTN} disabled={editBusy}
-                onClick={() => { setEditId(null); setEditError(''); }}>Cancel</button>
-              <span style={{ fontSize: 12, color: 'var(--text3)' }}>Ctrl+Enter to save · Esc to cancel</span>
-            </div>
-            {errLine(editError)}
-          </div>
+        {isEditing || u.delta
+          ? <SJUpdateDoc key={pageKey + (isEditing ? ':edit' : ':read:' + u.version)} u={u} pageKey={pageKey} stamp={sjStamp(at)} editing={isEditing}
+              onSaved={replaceUpdate}
+              onClosed={view => { if (view && view.row) replaceUpdate(view.row); setEditing(pageKey, false); sjFocusLater('data-sj-edit', pageKey); }} />
           : <SJNoteText text={u.body} />}
       </div>;
     })}

@@ -974,3 +974,10 @@ button.wl-sec-toggle { background:none; border:none; padding:6px 0; min-height:4
    for long standalone notes); the History tab shows a saved Summary read-only with the same read view. */
 .sj-summary .pn-panel--page .pn-head--sticky { position: static; }
 .pn-read-sj { overflow: visible; }
+
+/* Landing 89: a dated update is a Notes page panel too. Read, it is just the text under the update's own row (stamp,
+   Edit, Delete): no card, no header. Editing, it is the panel as the Summary is. */
+.sj-update .pn-panel--page { background: none; border: 0; padding: 0; }
+.sj-update .pn-panel--page:not(.pn-editing) .pn-head { display: none; }
+.sj-update .pn-panel--page.pn-editing { background: var(--panel); border: 1px solid var(--line); padding: 10px 14px 12px; }
+.sj-update .pn-panel--page .pn-head--sticky { position: static; }
