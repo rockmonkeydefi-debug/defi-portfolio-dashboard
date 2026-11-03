@@ -741,17 +741,16 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
       {row}
       <div className="spot-detail" style={{ padding: '16px 16px 20px 56px', borderBottom: SPOT_ROW_LINE, background: 'var(--bg)',
                                             display: 'flex', flexDirection: 'column', gap: 14 }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
-          <span style={{ display: 'inline-flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
-            <span style={{ fontSize: 16, fontWeight: 700, color: 'var(--text)' }}>{sym}</span>
-            <span style={{ fontSize: 13, color: 'var(--text3)' }}>{chainLabel}</span>
-          </span>
+        {/* Landing 90: no heading (the row above already names the token and chain); Book sits on the Held at line */}
+        {walletTag && <div style={{ fontSize: 13, color: 'var(--text3)', overflowWrap: 'anywhere' }}>{walletTag.detail}</div>}
+        <div className="spot-held-book" style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+          <div style={{ flex: '1 1 320px', minWidth: 0 }}>
+            <SpotHeldAt key={'held-' + key} row={r} status={venues.status} saved={spotVenuesForKey(venues.list, key)} options={venues.options} onSaved={onVenuesSaved} />
+          </div>
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--text3)' }}>
             Book <SpotBookSelect row={r} onSaved={onBookSaved} onError={setBookError} />
           </span>
         </div>
-        {walletTag && <div style={{ fontSize: 13, color: 'var(--text3)', overflowWrap: 'anywhere' }}>{walletTag.detail}</div>}
-        <SpotHeldAt key={'held-' + key} row={r} status={venues.status} saved={spotVenuesForKey(venues.list, key)} options={venues.options} onSaved={onVenuesSaved} />
         {/* Landing 60: the plan and the notes as cards, side by side on a wide screen (.spot-detail-grid) */}
         <div className={'spot-detail-grid' + (planTrade ? ' two' : '')}>
           {planTrade && <SpotPlan key={'plan-' + planTrade.trade_id} trade={planTrade} hideValues={hideValues} onSaved={onPlanSaved}

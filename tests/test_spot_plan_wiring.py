@@ -118,16 +118,20 @@ def test_open_positions_wiring():
     # the chip sits in the Trade opened cell, after the date
     cell = _between(row, 'data-label="Trade opened"', "    </div>;")
     assert cell.index("{opened}") < cell.index("No plan</span>")
-    # Landing 60: the token as the detail's heading, then the wallet line, then the two cards
+    # Landing 60: the wallet line, then the two cards. Landing 90 (Glenn's OK): no heading any more (the row above
+    # names the token and chain); the Held at line carries the Book selector on its right.
     detail = _between(row, '<div className="spot-detail"', "</React.Fragment>;")
-    heading = "<span style={{ fontSize: 16, fontWeight: 700, color: 'var(--text)' }}>{sym}</span>"
+    assert "fontSize: 16, fontWeight: 700" not in detail and "{chainLabel}" not in detail
+    heading = '<div className="spot-held-book"'
     grid = "<div className={'spot-detail-grid' + (planTrade ? ' two' : '')}>"
     plan = NL.join(["{planTrade && <SpotPlan key={'plan-' + planTrade.trade_id} trade={planTrade} hideValues={hideValues} onSaved={onPlanSaved}",
                     "            atOpen={<SpotHistoryAtOpen trade={planTrade} />} />}"])
     notes = '<SpotCard title="Notes" accent="var(--adapt)">'
     for part in (heading, grid, plan, notes):
         assert detail.count(part) == 1, part
-    order = [detail.index(x) for x in (heading, "{walletTag && <div", grid, plan, notes, "<SpotJournal row={r}")]
+    order = [detail.index(x) for x in ("{walletTag && <div", heading, "<SpotHeldAt key={'held-' + key}",
+                                       "Book <SpotBookSelect row={r} onSaved={onBookSaved} onError={setBookError} />",
+                                       grid, plan, notes, "<SpotJournal row={r}")]
     assert order == sorted(order)
     saved = _between(js, "  function onPlanSaved(id, plan) {", NL + "  }" + NL)
     assert "open[k] = x.trade_id === id ? { ...x, plan, plan_missing: splMissing(x, plan) } : x;" in saved
