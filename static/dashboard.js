@@ -47,11 +47,13 @@ const DASH_MASK_WARNING = '⚠ Details hidden while values are hidden';
 
 // Parts table rows, in order (compose_total component keys).
 const DASH_PART_ROWS = [
+  // Landing 91: MaxFi is hidden, but the total still counts MaxFi LP and MaxFi fees, so their rows stay here; like
+  // every other part they show only when non-zero or carrying a warning (no longer always).
   ['wallet_tokens', 'Wallet tokens'], ['stablecoins', 'Stablecoins'], ['maxfi_lp', 'MaxFi LP'],
   ['other_lp', 'Other LP'], ['lp_uncollected', 'LP fees'], ['maxfi_uncollected', 'MaxFi fees'],
   ['hyperliquid', 'Hyperliquid'], ['txflow', 'TxFlow'], ['lending_net', 'Lending (net)'], ['gmx', 'GMX collateral'],
 ];
-const DASH_IDLE_KEYS = ['wallet_tokens', 'stablecoins', 'maxfi_lp', 'maxfi_uncollected', 'hyperliquid'];
+const DASH_IDLE_KEYS = ['wallet_tokens', 'stablecoins', 'hyperliquid'];
 // A part's as-of turns --dash-warn when older than this.
 const DASH_STALE_MS = { hyperliquid: 30 * 60000, txflow: 30 * 60000, maxfi_uncollected: 24 * 3600000 };
 const DASH_STALE_DEFAULT_MS = 135 * 60000;
@@ -305,207 +307,9 @@ function DashBtcCard({ snap, status }) {
   </>);
 }
 
-/* ── ROW 1 Right: MaxFi advisor card (GET /api/maxfi/advisor?kick=0 + /api/maxfi/range/<chain>/<wallet>) ── */
-const DASH_MAXFI_CHAINS = [['robinhood', 'RH'], ['base', 'Base']];
-// A range request that has not answered after 20 s is aborted (-> not checked).
-const DASH_RANGE_TIMEOUT_MS = 20000;
-
-function _dashChainLabel(chain) {
-  const c = DASH_MAXFI_CHAINS.find(x => x[0] === chain);
-  return c ? c[1] : String(chain || '');
-}
-
-// MaxFi page rule: any flag means No verdict.
-function _dashVerdict(p) {
-  const flags = Array.isArray(p.flags) ? p.flags : [];
-  const v = String(p.verdict || '').toUpperCase();
-  if (!flags.length && v === 'HOLD') return 'hold';
-  if (!flags.length && v === 'CLOSE') return 'close';
-  return 'none';
-}
-
-function _dashPair(p) {
-  const s = p.symbols || {};
-  return s.token0 && s.token1 ? s.token0 + '/' + s.token1 : '#' + p.token_id;
-}
-
-// A number, or null for null / blank / non-finite (_dashNum reads null as 0).
+// A finite number or null (used across the page; it sat with the MaxFi card until Landing 91).
 function _dashFinite(v) {
   return v == null || v === '' ? null : _dashNum(v);
-}
-
-function _dashMaxfiModel({ advisor, wallets, range, hideValues, nowMs }) {
-  if (advisor.status !== 'ok') return { status: advisor.status };
-  const data = advisor.data;
-  const all = data.positions.filter(p => p && typeof p === 'object');
-  const lower = (p) => String(p.wallet || '').toLowerCase();
-  let positions = all, rangeNote = null;
-  if (wallets.status === 'error') rangeNote = 'Range not checked: wallet list unavailable.';
-  else if (wallets.status === 'ok') {
-    const inList = new Set(wallets.list.map(w => w.address));
-    positions = all.filter(p => inList.has(lower(p)));
-  }
-
-  const rows = positions.map(p => {
-    const r = range[p.chain + '|' + lower(p)];
-    let state;
-    if (wallets.status === 'error' || !DASH_MAXFI_CHAINS.some(c => c[0] === p.chain)) state = 'unknown';
-    else if (wallets.status === 'loading' || !r) state = 'pending';
-    else if (r.status === 'ok') {
-      const e = (r.positions || []).find(x => x && String(x.token_id) === String(p.token_id));
-      state = e && e.status === 'ok' && e.in_range === true ? 'in' : e && e.status === 'ok' && e.in_range === false ? 'out' : 'unknown';
-    } else if (r.loading) state = 'pending';
-    else state = 'unknown';
-    return { p, verdict: _dashVerdict(p), state, pair: _dashPair(p), chain: _dashChainLabel(p.chain), value: _dashFinite(p.current_value_usd) };
-  });
-  const count = (k, v) => rows.filter(x => x[k] === v).length;
-
-  let fees = 0, rated = 0;
-  for (const x of rows) {
-    const rate = _dashFinite(x.p.run_rate_7d_pct_day);
-    if (rate != null && x.value != null && x.value > 0) { fees += rate / 100 * x.value; rated++; }
-  }
-  if (rows.length && !rated) fees = null;
-
-  const rank = { close: 0, none: 1 };
-  const actions = rows.filter(x => x.verdict !== 'hold')
-    .sort((x, y) => rank[x.verdict] - rank[y.verdict] || (y.value || 0) - (x.value || 0)).slice(0, 2);
-
-  let stamp = null;
-  for (const x of rows) {
-    const d = _dashParseUtc(x.p.current_value_at);
-    if (d && (!stamp || d < stamp)) stamp = d;
-  }
-
-  const failed = [];
-  if (wallets.status === 'ok') {
-    for (const w of wallets.list) {
-      for (const [chain, label] of DASH_MAXFI_CHAINS) {
-        const r = range[chain + '|' + w.address];
-        if (r && r.status === 'error' && !r.loading) {
-          failed.push(label + (wallets.list.length > 1 && w.label ? ' (' + w.label + ')' : ''));
-        }
-      }
-    }
-  }
-
-  const order = { in: 0, out: 1, unknown: 2, pending: 3 };
-  return {
-    status: 'ok', rows: rows.slice().sort((x, y) => order[x.state] - order[y.state]),
-    M: rows.length, inN: count('state', 'in'), outN: count('state', 'out'),
-    unknownN: count('state', 'unknown'), pendingN: count('state', 'pending'),
-    holdN: count('verdict', 'hold'), closeN: count('verdict', 'close'), noneN: count('verdict', 'none'),
-    fees, noRate: rows.length - rated, actions, stamp,
-    stale: !!stamp && nowMs - stamp.getTime() > DASH_STALE_MS.maxfi_uncollected,
-    failed: [...new Set(failed)], rangeNote, claimsUnavailable: !!data.claims_unavailable,
-  };
-}
-
-const DASH_RANGE_WORD = { in: 'in range', out: 'out of range', unknown: 'not checked', pending: 'not checked' };
-const DASH_VERDICT_CHIPS = [['hold', 'Hold', 'var(--dash-pos)'], ['close', 'Close', 'var(--dash-warn)'], ['none', 'No verdict', 'var(--dash-text4)']];
-
-function DashMaxfiCard({ model, hideValues, onOpen }) {
-  const link = <button type="button" className="dash-link" onClick={onOpen}>Open MaxFi →</button>;
-  const loading = model.status === 'loading';
-  const ok = model.status === 'ok';
-  const header = (
-    <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
-      <div className="dash-label">MAXFI · ADVISOR</div>
-      <div style={{ flex: 1 }} />
-      <div className="dash-num" style={{ fontSize: 12, color: ok && model.stale ? 'var(--dash-warn)' : 'var(--dash-text4)' }}>
-        {_dashClock(ok ? model.stamp : null) + ' · maxfi_positions'}
-      </div>
-    </div>
-  );
-  const shell = (children) => (
-    <div className="dash-card" style={{ padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 12 }}>
-      {header}{children}
-    </div>
-  );
-  const msg = (t) => <div style={{ fontSize: 13, color: 'var(--dash-text3)' }}>{t}</div>;
-  if (model.status === 'error') return shell(<>{msg('MaxFi advisor unavailable.')}{link}</>);
-  if (ok && model.M === 0) return shell(<>{msg('No MaxFi positions. The advisor has nothing to review.')}{link}</>);
-
-  const n = (v) => (loading ? '…' : hideValues ? DASH_MASK_COUNT : v);
-  let sub = null;
-  if (ok) {
-    if (model.pendingN === model.M) sub = 'Checking range…';
-    else {
-      const parts = [];
-      if (model.unknownN > 0) parts.push(n(model.unknownN) + ' not checked');
-      if (model.pendingN > 0) parts.push(n(model.pendingN) + ' checking');
-      sub = parts.join(' · ') || null;
-    }
-  }
-  const feesText = loading ? '…' : hideValues ? DASH_MASK_MONEY : model.fees == null ? '—' : fmt(model.fees, 2);
-  const squareStyle = (state) => ({
-    width: 14, height: 14, borderRadius: 3, boxSizing: 'border-box',
-    background: state === 'in' ? 'var(--dash-pos)' : state === 'out' ? 'var(--dash-warn)' : 'var(--dash-raised)',
-    border: state === 'in' || state === 'out' ? 'none' : '1px solid var(--dash-text4)',
-  });
-
-  return shell(<>
-    <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 16 }}>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0 }}>
-        <div>
-          <span className="dash-num" style={{ fontSize: 26, color: 'var(--dash-text)' }}>
-            {loading ? '…' : hideValues ? '•• of ••' : model.inN + ' of ' + model.M}
-          </span>
-          <span style={{ fontSize: 13, color: 'var(--dash-text3)' }}> in range</span>
-        </div>
-        {sub && <div style={{ fontSize: 12, color: 'var(--dash-text3)' }}>{sub}</div>}
-        {ok && (hideValues
-          ? <div className="dash-maxfi-squares" role="img" aria-label="Range hidden while values are hidden" />
-          : (
-            <div className="dash-maxfi-squares" role="img" aria-label={model.inN + ' of ' + model.M + ' in range'}>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-                {model.rows.map(x => (
-                  <span key={x.p.id != null ? x.p.id : x.p.chain + x.p.token_id} title={x.pair + ' · ' + x.chain + ' · ' + DASH_RANGE_WORD[x.state]} style={squareStyle(x.state)} />
-                ))}
-              </div>
-            </div>
-          ))}
-      </div>
-      <div title="Advisor 7-day run rate × current value, summed" style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-        <div className="dash-label">FEES RUN RATE</div>
-        <div>
-          <span className="dash-num" style={{ fontSize: 18, color: 'var(--dash-text)' }}>{feesText}</span>
-          <span style={{ fontSize: 12, color: 'var(--dash-text3)' }}> / day</span>
-        </div>
-        {ok && model.noRate > 0 && (
-          <div style={{ fontSize: 11, color: 'var(--dash-text4)' }}>{(hideValues ? DASH_MASK_COUNT : model.noRate) + ' without a rate'}</div>
-        )}
-      </div>
-    </div>
-    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-      {DASH_VERDICT_CHIPS.map(([key, label, dot]) => (
-        <span key={key} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--dash-text2)',
-          background: 'var(--dash-band)', border: '1px solid var(--dash-line)', borderRadius: 999, padding: '2px 10px' }}>
-          <span aria-hidden="true" style={{ width: 7, height: 7, borderRadius: '50%', background: dot }} />
-          {label} <span className="dash-num">{n(ok ? model[key + 'N'] : 0)}</span>
-        </span>
-      ))}
-    </div>
-    {ok && model.actions.length > 0 && (
-      <div className="dash-maxfi-actions">
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-          {model.actions.map(x => (
-            <div key={x.p.id != null ? x.p.id : x.p.chain + x.p.token_id} style={{ display: 'flex', justifyContent: 'space-between', gap: 8,
-              background: 'var(--dash-band)', borderRadius: 6, padding: '6px 10px', fontSize: 12 }}>
-              <span style={{ color: 'var(--dash-text2)', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{x.pair + ' · ' + x.chain}</span>
-              <span style={{ color: x.verdict === 'close' ? 'var(--dash-warn)' : 'var(--dash-text3)', whiteSpace: 'nowrap' }}>{x.verdict === 'close' ? 'Close' : 'No verdict'}</span>
-            </div>
-          ))}
-        </div>
-      </div>
-    )}
-    {ok && model.claimsUnavailable && <div style={{ fontSize: 12, color: 'var(--dash-warn)' }}>Ledger unavailable: verdicts withheld</div>}
-    {ok && model.failed.length > 0 && (
-      <div style={{ fontSize: 12, color: 'var(--dash-warn)' }}>{'Range check failed: ' + model.failed.join(' · ') + ' — Refresh to retry.'}</div>
-    )}
-    {ok && model.rangeNote && <div style={{ fontSize: 12, color: 'var(--dash-text3)' }}>{model.rangeNote}</div>}
-    {link}
-  </>);
 }
 
 /* ── ROW 1 Right: Lending card (GET /api/portfolio aave_positions) ── */
@@ -1265,7 +1069,7 @@ function _dashHeroModel({ totalState, totalData, fallback, unavailableSince, spo
       const loadingWarning = key === 'txflow' ? 'TxFlow loading' : 'Hyperliquid loading';
       let warnings = (Array.isArray(c.warnings) ? c.warnings : []).filter(w => !(pending && w === loadingWarning));
       if (key === 'maxfi_lp') warnings = warnings.concat(drift);
-      if (!(key === 'maxfi_lp' || warnings.length || pending || _dashNonZero(value))) continue;
+      if (!(warnings.length || pending || _dashNonZero(value))) continue;
       const asOf = _dashParseUtc(c.as_of);
       const d = c.detail || {};
       let sub = null;
@@ -1307,7 +1111,7 @@ function _dashHeroModel({ totalState, totalData, fallback, unavailableSince, spo
       notes.push({ tone: 'warn', text: 'Live total unavailable — showing the last snapshot run. Its parts use the same definition as the live total.' });
       for (const [key, label] of DASH_PART_ROWS) {
         const value = _dashNum(row[key + '_usd']);
-        if (!(key === 'maxfi_lp' || _dashNonZero(value || 0))) continue;
+        if (!_dashNonZero(value || 0)) continue;
         rows.push({
           key, label, value, pendingText: null, share: shareOf(value, total), asOf: rowTime,
           asOfText: _dashClock(rowTime), stale: staleFor(key, rowTime), source: 'snapshot #' + row.id,
@@ -1406,7 +1210,7 @@ function DashPartsTable({ rows, extras, hideValues }) {
   );
 }
 
-function DashHeroCard({ model, hideValues, refreshing, totalIdle, onRefresh, maxfiAttention }) {
+function DashHeroCard({ model, hideValues, refreshing, totalIdle, onRefresh }) {
   const busy = refreshing || totalIdle;
   const n = model.warnCount;
   const countText = hideValues ? DASH_MASK_COUNT : String(n);
@@ -1419,28 +1223,12 @@ function DashHeroCard({ model, hideValues, refreshing, totalIdle, onRefresh, max
     el.focus({ preventScroll: true });
   };
   const totalText = model.total == null ? model.totalEmpty : hideValues ? DASH_MASK_TOTAL : fmt(model.total, 2);
-  // MaxFi positions out of range or with verdict Close (ruling Sep 29).
-  const mxN = maxfiAttention || 0;
-  const mxCount = hideValues ? DASH_MASK_COUNT : String(mxN);
-  const mxWord = (!hideValues && mxN === 1) ? 'needs attention' : 'need attention';
-  const goMaxfi = () => {
-    const el = document.getElementById('dash-maxfi');
-    if (!el) return;
-    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
-    el.focus({ preventScroll: true });
-  };
   return (
     <div className="dash-card" style={{ overflow: 'hidden' }}>
       <div style={{ padding: '18px 20px 16px', display: 'flex', flexDirection: 'column', gap: 8 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
           <div className="dash-label">TOTAL PORTFOLIO VALUE</div>
           <div style={{ flex: 1 }} />
-          {mxN > 0 && (
-            <button type="button" className="dash-badge" onClick={goMaxfi}
-              aria-label={'MaxFi: ' + mxCount + ' positions need attention — go to the MaxFi card'}>
-              MaxFi: {mxCount} {mxWord}
-            </button>
-          )}
           {n > 0 && (
             <button type="button" className="dash-badge" onClick={goFirst}
               aria-label={countText + ' ' + warnWord + ' — go to the first'}>
@@ -2288,11 +2076,6 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
   const [fallback,    setFallback]    = useDashState({ status: 'idle', row: null });
   const [unavailableSince, setUnavailableSince] = useDashState(null);
   const [loadCount,   setLoadCount]   = useDashState(0);
-  // MaxFi card: advisor (?kick=0), the MaxFi wallets from /api/wallets, and the
-  // on-chain range checks keyed chain + '|' + wallet (lowercase).
-  const [advisor,     setAdvisor]     = useDashState({ status: 'loading', data: null });
-  const [mxWallets,   setMxWallets]   = useDashState({ status: 'loading', list: [] });
-  const [mxRange,     setMxRange]     = useDashState({});
   // 'loading' | 'ok' | 'error' for /api/portfolio and /api/market-data.
   const [portfolioStatus, setPortfolioStatus] = useDashState('loading');
   const [marketStatus,    setMarketStatus]    = useDashState('loading');
@@ -2383,38 +2166,6 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
     fallbackGenRef.current += 1;
   }, []);
 
-  // Range checks (an RPC call per wallet and chain): one wallet at a time, both
-  // chains in parallel. A newer fetchAll or unmount stops the loop before its
-  // next wallet; answers from a retired generation are dropped.
-  const runRange = useDashCallback(async (gen, list) => {
-    const live = () => gen === allGenRef.current;
-    for (const w of list) {
-      if (!live()) return;
-      await Promise.all(DASH_MAXFI_CHAINS.map(async ([chain]) => {
-        const key = chain + '|' + w.address;
-        setMxRange(m => ({ ...m, [key]: { ...(m[key] || {}), loading: true } }));
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), DASH_RANGE_TIMEOUT_MS);
-        let result;
-        try {
-          const r = await fetch('/api/maxfi/range/' + chain + '/' + w.address, { signal: ctrl.signal });
-          let body = null;
-          try { body = await r.json(); } catch (e) { if (e && e.name === 'AbortError') throw e; }
-          if (!r.ok || !body || typeof body !== 'object' || !Array.isArray(body.positions) || body.error) {
-            result = { status: 'error', positions: [], error: (body && body.error) || 'HTTP ' + r.status };
-          } else {
-            result = { status: 'ok', positions: body.positions, error: null };
-          }
-        } catch (e) {
-          result = { status: 'error', positions: [], error: e && e.name === 'AbortError' ? 'timeout' : 'network' };
-        } finally {
-          clearTimeout(timer);
-        }
-        if (live()) setMxRange(m => ({ ...m, [key]: { ...result, loading: false } }));
-      }));
-    }
-  }, []);
-
   // Each source sets its own state as it answers; a response from an older
   // call is discarded. The live total starts once /api/portfolio settles
   // (its cache is then warm).
@@ -2453,17 +2204,8 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
       load('/api/spot/change-24h', d => setSpotChange(d && d.positions && typeof d.positions === 'object'
         ? { status: 'ok', data: d } : { status: 'error', data: null }), null),
       load('/api/spot/history', d => { setSpotHistory(Array.isArray(d) ? d : []); setHistoryStatus(Array.isArray(d) ? 'ok' : 'error'); }, null),
-      load('/api/maxfi/advisor?kick=0', d => setAdvisor(d && Array.isArray(d.positions) ? { status: 'ok', data: d } : { status: 'error', data: null }), null),
-      // The range loop is started, not returned: Refresh does not wait for it.
-      load('/api/wallets', d => {
-        const ok = !!(d && Array.isArray(d.wallets));
-        const list = ok ? d.wallets.filter(w => w && w.maxfi === true)
-          .map(w => ({ address: String(w.address).toLowerCase(), label: w.label || '' })) : [];
-        setMxWallets({ status: ok ? 'ok' : 'error', list });
-        if (live() && list.length) runRange(gen, list);
-      }, null),
     ]);
-  }, [fetchTotal, runRange, loadBtPerf, loadPerpsOpen]);
+  }, [fetchTotal, loadBtPerf, loadPerpsOpen]);
 
   useDashEffect(() => { fetchAll(); }, []);
 
@@ -2518,9 +2260,6 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
   const tradingModel = _dashTradingModel({ trades: tradesState, perps: perpsOpen, nowMs: Date.now() });
   const hlModel = _dashHlModel(totalState, totalData, Date.now());
   const onOpenSpot = () => { setActiveTab && setActiveTab('spot'); };
-  const maxfiModel = _dashMaxfiModel({ advisor, wallets: mxWallets, range: mxRange, hideValues, nowMs: Date.now() });
-  const maxfiAttention = maxfiModel.status === 'ok'
-    ? maxfiModel.rows.filter(x => x.state === 'out' || x.verdict === 'close').length : 0;
   const liveTotal = totalState === 'ok' && totalData ? _dashFinite(totalData.total_usd) : null;
   const spotCards = _dashSpotCardsModel(spotPnl, spotChange.data, liveTotal);
   const moversStatus = spotStatus === 'error' || spotChange.status === 'error' ? 'error'
@@ -2532,7 +2271,7 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
       {/* ── ROW 1 — Hero + right column ── */}
       <div className="dash-row1">
         <DashHeroCard model={heroModel} hideValues={hideValues} refreshing={refreshing}
-          totalIdle={totalState === 'idle'} onRefresh={handleRefresh} maxfiAttention={maxfiAttention} />
+          totalIdle={totalState === 'idle'} onRefresh={handleRefresh} />
 
         <div className="dash-right">
           <DashSpotMoversCard model={spotCards} status={moversStatus} hideValues={hideValues} onOpen={onOpenSpot} />
@@ -2561,11 +2300,8 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
         </div>
       </div>
 
-      {/* ── ROW 4 — MaxFi + Market + Lending ── */}
+      {/* -- ROW 4: Market + Lending (Landing 91: the MaxFi card is gone) -- */}
       <div className="dash-row4">
-        <div id="dash-maxfi" tabIndex={-1}>
-          <DashMaxfiCard model={maxfiModel} hideValues={hideValues} onOpen={() => setActiveTab && setActiveTab('maxfi')} />
-        </div>
         <DashBtcCard snap={marketData?.snapshot || {}} status={marketStatus} />
         <DashLendingCard portfolio={portfolio} status={portfolioStatus} hideValues={hideValues} />
       </div>
