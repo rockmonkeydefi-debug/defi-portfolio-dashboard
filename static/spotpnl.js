@@ -516,7 +516,7 @@ function SpotKpi({ label, value, color, sub }) {
 }
 
 // journal = the page-level journal state (SpotPnlScreen): openRows (Set of
-// position_key), drafts / composing (maps by position_key) and their setters.
+// position_key), editing (map of the open editors by panel key, Landing 89) and their setters.
 function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
   const [data, setData] = useState(null);
   const [loadError, setLoadError] = useState(false);
@@ -759,8 +759,7 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
           <SpotCard title="Notes" accent="var(--adapt)">
             {hasAddress
               ? <SpotJournal row={r} updates={ups} notesError={notesError} onSummarySaved={onNoteSaved} onUpdatesChanged={onUpdatesChanged}
-                  draft={journal.drafts[key] || ''} onDraftChange={v => journal.setDrafts(prev => ({ ...prev, [key]: v }))}
-                  composing={!!journal.composing[key]} setComposing={v => journal.setComposing(prev => ({ ...prev, [key]: v }))} />
+                  editing={journal.editing} setEditing={(panelKey, open) => journal.setEditing(prev => ({ ...prev, [panelKey]: open }))} />
               : <div style={{ fontSize: 13, color: 'var(--text3)' }}>Notes need a chain and contract address - add them on the Backfill tab.</div>}
           </SpotCard>
         </div>
@@ -1706,12 +1705,13 @@ function SpotPnlScreen({ hideValues, refreshTrigger, setActiveTab }) {
     setSubTab(t);
     try { localStorage.setItem('spotSubTab', t); } catch (_e) { /* the tab still changes */ }
   }
-  // Journal state lives here so open rows and composer drafts outlive a
-  // collapsed row, a tab switch and a Refresh (until the page reloads).
+  // Journal state lives here so open rows and the open editors (a new update's
+  // composer, an update being edited; Landing 89: their drafts are the Notes
+  // editor's own, kept by pagenotes.js) outlive a collapsed row, a tab switch
+  // and a Refresh (until the page reloads).
   const [openRows, setOpenRows] = useState(() => new Set());
-  const [drafts, setDrafts] = useState({});
-  const [composing, setComposing] = useState({});
-  const journal = { openRows, setOpenRows, drafts, setDrafts, composing, setComposing };
+  const [editing, setEditing] = useState({});
+  const journal = { openRows, setOpenRows, editing, setEditing };
   // Header (Landing 19): the title, the Spot notes panel at full width, then
   // the tabs and Contracts (.spot-head in static/style.css). The panel shows
   // on every tab.

@@ -187,7 +187,7 @@ function SpotHistoryReview({ trade, onSaved }) {
   </div>;
 }
 
-// journal: the Spot page's journal state (drafts and composing by position_key).
+// journal: the Spot page's journal state (open editors by panel key, Landing 89).
 function SpotHistoryByTrade({ hideValues, refreshTrigger, bookFilter, setBookFilter, journal }) {
   const [trades, setTrades] = useSHXState(null);
   const [loadError, setLoadError] = useSHXState(false);
@@ -364,8 +364,7 @@ function SpotHistoryByTrade({ hideValues, refreshTrigger, bookFilter, setBookFil
                 ? <SpotJournal row={{ position_key: key, symbol: t.symbol, note: summary }} updates={updatesByKey[key] || []}
                     scope={'t' + id}
                     notesError={notesError} onSummarySaved={onSummarySaved} onUpdatesChanged={onUpdatesChanged}
-                    draft={journal.drafts[key] || ''} onDraftChange={v => journal.setDrafts(prev => ({ ...prev, [key]: v }))}
-                    composing={!!journal.composing[key]} setComposing={v => journal.setComposing(prev => ({ ...prev, [key]: v }))} />
+                    editing={journal.editing} setEditing={(panelKey, open) => journal.setEditing(prev => ({ ...prev, [panelKey]: open }))} />
                 : <React.Fragment>
                     {hasJournal && <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                       <span style={SHX_SECTION}>Summary</span>
@@ -382,7 +381,9 @@ function SpotHistoryByTrade({ hideValues, refreshTrigger, bookFilter, setBookFil
                           {u.trade_id && <span style={{ fontSize: 12, color: 'var(--text3)' }}>from Trade Log</span>}
                           {u.edited_at && <span style={{ fontSize: 12, color: 'var(--text3)' }} title={'Edited ' + sjStamp(sjParseTime(u.edited_at))}>edited</span>}
                         </div>
-                        <SJNoteText text={u.body} />
+                        {u.delta && window.PageNotesRead
+                          ? <div className="pn-read pn-read-sj"><window.PageNotesRead delta={u.delta} /></div>
+                          : <SJNoteText text={u.body} />}
                       </div>;
                     })}
                     {legacy && <div style={{ display: 'flex', flexDirection: 'column', gap: 6, paddingTop: 10, borderTop: SHX_LINE }}>

@@ -6,7 +6,8 @@ covered by tests/test_spot_summary_rich.py and the headless-browser runs).
   exported for the History tab.
 - static/spotjournal.js: SJSummary mounts the panel with the Summary routes behind it (the page key for drafts,
   the version token as base_id, the legacy text converted by sjToDelta); SpotJournal no longer has its own
-  textarea Summary; the dated updates are untouched until Landing 89.
+  textarea Summary (Landing 89 then moved the dated updates into the same editor: see
+  tests/test_spot_updates_rich_wiring.py).
 - static/spothistory.js: the collapsed Summary reads the document when there is one and the plain text when not.
 - static/style.css: the panel's header stays put inside the Notes card.
 """
@@ -38,7 +39,7 @@ def _body(src, start, end):
 
 def test_the_panel_takes_an_io_and_keeps_the_page_notes_requests_for_no_io():
     src = _read("static/pagenotes.js")
-    assert "function PageNotesPanel({ page, hideValues, label, variant, io, emptyText }) {" in src
+    assert "function PageNotesPanel({ page, hideValues, label, variant, io, emptyText, startInEdit, onClosed }) {" in src
     assert src.count("'/api/page-notes/' + page") == 2                    # also pinned by test_page_notes_wiring
     assert "(io ? io.get() : pnRequest('GET', '/api/page-notes/' + page)).then(res => {" in src
     assert ("const res = io ? await io.put(delta, baseId) : await pnRequest('PUT', '/api/page-notes/' + page, "
@@ -93,7 +94,7 @@ def test_two_panels_of_one_position_get_their_own_drafts():
 
 def test_the_summary_panel_is_mounted_with_the_summary_routes():
     src = _read("static/spotjournal.js")
-    body = _body(src, "function SJSummary(", "function sjTrimEnd(")
+    body = _body(src, "function SJSummary(", "// -- A dated update in the Notes page editor (Landing 89)")
     assert "const Panel = window.PageNotesPanel;" in body
     assert "'/api/spot/position-notes/view' + query" in body
     assert "pnRequest('PUT', '/api/spot/position-notes', { chain, contract_address, delta, base_id: baseId })" in body
@@ -127,17 +128,7 @@ def test_the_journal_has_no_textarea_summary_any_more():
     assert "<SJSummary key={key} chain={chain} contract_address={contract_address} symbol={symbol}" in journal
     assert "onSaved={(text, delta) => onSummarySaved(key, text, delta)}" in journal
     assert "symbol={symbol} scope={scope}" in journal
-    assert "composing, setComposing, scope }) {" in src
-
-
-def test_the_dated_updates_are_unchanged_until_landing_89():
-    src = _read("static/spotjournal.js")
-    journal = src[src.index("function SpotJournal("):]
-    assert "'/api/spot/note-updates', { method: 'POST'" in journal
-    assert "'/api/spot/note-updates/' + u.id, { method: 'PUT'" in journal
-    assert "'/api/spot/note-updates/' + u.id, { method: 'DELETE' }" in journal
-    assert journal.count("<SJEditor ") == 2                                 # compose and edit
-    assert "SJ_MAX = 2000" in src
+    assert "editing, setEditing, scope }) {" in src
 
 
 def test_every_top_level_name_added_to_the_file_keeps_the_prefix():
@@ -150,7 +141,7 @@ def test_every_top_level_name_added_to_the_file_keeps_the_prefix():
 def test_the_file_adds_nothing_outside_ascii():
     # The source stays ASCII where this landing wrote it: the new block builds nothing from raw symbols.
     block = _read("static/spotjournal.js")
-    block = block[block.index("const SJ_SUMMARY_EMPTY"):block.index("function sjTrimEnd(")]
+    block = block[block.index("const SJ_SUMMARY_EMPTY"):block.index("// -- A dated update in the Notes page editor (Landing 89)")]
     block = block.replace("\u2500", "")          # the file's own section rule below the block is not part of it
     assert all(ord(c) < 128 for c in block)
 
