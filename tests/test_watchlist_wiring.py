@@ -203,7 +203,7 @@ def test_the_trend_source_is_the_fresher_of_the_scanner_and_the_saved_check():
 def test_an_older_list_read_never_overwrites_a_newer_reply():
     assert "const seen = mutationsRef.current;" in JS
     assert "mutationsRef.current !== seen" in JS
-    assert JS.count("mutationsRef.current += 1;") == 3        # a list reply, a saved check, a delete that found it gone
+    assert JS.count("mutationsRef.current += 1;") == 4        # a list reply, a saved check, a delete that found it gone, a question that found it gone (Landing 93)
 
 
 def test_toggling_active_announces_and_keeps_the_keyboard_place():
@@ -344,3 +344,25 @@ def test_clicks_made_while_the_delete_runs_win():
     assert "const moveFocus = !at || at === document.body || !!(row && row.contains(at));" in fn
     assert fn.index("const moveFocus") < fn.index("deletedRef.current[key] = true;")
     assert "if (moveFocus) setTimeout(() => {" in fn and "if (now && now !== document.body) return;" in fn
+
+
+def test_a_deleted_tokens_draft_goes_with_it_and_a_404_question_reloads_the_list():
+    """Landing 93 (found in Landing 87's review): the delete drops the token's unsaved note draft; a question that
+    meets a 404 (the token was deleted in another window) says so and asks the page to read the list again."""
+    helper = _between(JS, "function wlDropDraft(key) {", NL + "}" + NL)
+    assert "typeof pnDrafts !== 'undefined' && pnDrafts" in helper and "delete pnDrafts[key];" in helper
+    fn = _delete_item()
+    assert fn.index("deletedRef.current[key] = true;") < fn.index("wlDropDraft(key);")       # only once the token is really gone
+    assert fn.index("wlDropDraft(key);") < fn.index("showFlash((res.status === 200 ? res.data.name")
+    assert "wlDropDraft" not in fn.split("changed: true", 1)[0]                             # a refused (409) delete keeps the draft
+    sec = _token_section()
+    load_q = _between(sec, "async function loadQuestion(note) {", NL + "  }" + NL)
+    assert "else if (res && res.status === 404 && onGone) onGone();" in load_q
+    assert load_q.index("res.status === 404") < load_q.index("wlError(res,")                  # the raw server text is the fallback only
+    assert "function WlTokenSection({ item, expanded, checking, busy, copied, onCopy, onDelete, onGone }) {" in JS
+    assert "onCopy={copyContract} onDelete={onDelete} onGone={onGone} />" in JS
+    assert "onGone={() => tokenGone(item.key)} />;" in JS
+    gone = _between(JS, "function tokenGone(key) {", NL + "  }" + NL)
+    assert "was already deleted, maybe in another window.')" in gone and gone.index("showFlash(") < gone.index("wlDropDraft(key);")   # the row leaves, so the page says it
+    assert gone.index("wlDropDraft(key);") < gone.index("mutationsRef.current += 1;") < gone.index("items.filter(i => i.key !== key)") < gone.index("load();")
+    assert "deletedRef" not in gone                                                           # a token that does exist comes back with the re-read
