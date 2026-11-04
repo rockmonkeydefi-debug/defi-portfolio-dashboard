@@ -15671,8 +15671,11 @@ def api_note_tabs_delete_preview(key):
             if tab is None:
                 return jsonify({'error': 'unknown tab'}), 404
             active, _ = _note_tabs_ordered(tabs)
-            plan = _watch_delete_plan(conn, key, keep)
+            # Landing 93: the stamp is read BEFORE the counts (as for a Watch List item, Landing 87). A save landing
+            # between the two reads leaves the stamp older than the state, so the delete is refused (409) instead of
+            # passing with counts that are out of date.
             stamp = _note_tab_delete_stamp(conn, key)
+            plan = _watch_delete_plan(conn, key, keep)
         finally:
             conn.close()
         return jsonify({"key": key, "label": tab["label"], "archived": tab["archived"],
