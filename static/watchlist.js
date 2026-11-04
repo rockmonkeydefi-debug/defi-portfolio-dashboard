@@ -326,8 +326,14 @@ function wlUploadsBusy() {
   } catch (e) { return false; }
 }
 
+// Landing 93: a deleted token's unsaved note draft goes with it (the Notes tab delete does the same, in notebook.js),
+// so a later delete does not keep an image "for an unsaved note elsewhere" that no longer exists.
+function wlDropDraft(key) {
+  try { if (typeof pnDrafts !== 'undefined' && pnDrafts) delete pnDrafts[key]; } catch (e) { /* nothing to drop */ }
+}
+
 // The Token section of an opened row: chain, contract, what the notes use, and Delete token.
-function WlTokenSection({ item, expanded, checking, busy, copied, onCopy, onDelete }) {
+function WlTokenSection({ item, expanded, checking, busy, copied, onCopy, onDelete, onGone }) {
   const [usage, setUsage] = useWLState({ status: 'idle', data: null });
   const [confirm, setConfirm] = useWLState({ step: 'closed', data: null, error: '', keep: [] });
   const delBtnRef = useWLRef(null);
@@ -371,6 +377,7 @@ function WlTokenSection({ item, expanded, checking, busy, copied, onCopy, onDele
       setUsage({ status: 'ok', data: res.data });          // the line above the question shows the same counts
       setConfirm({ step: 'ready', data: res.data, error: note || '', keep: keepIds });
     }
+    else if (res && res.status === 404 && onGone) onGone();   // Landing 93: deleted in another window since the row was drawn; the row leaves and the page says so
     else setConfirm({ step: 'error', data: null, error: wlError(res, "Couldn't read what would be deleted."), keep: keepIds });
   }
 
@@ -456,7 +463,7 @@ function WlTokenSection({ item, expanded, checking, busy, copied, onCopy, onDele
   </div>;
 }
 
-function WlItemRow({ item, expanded, onToggle, live, busy, checking, checkBusy, notice, limits, hideValues, draftRaw, onDraft, onPatch, onCheck, onDismiss, onDelete }) {
+function WlItemRow({ item, expanded, onToggle, live, busy, checking, checkBusy, notice, limits, hideValues, draftRaw, onDraft, onPatch, onCheck, onDismiss, onDelete, onGone }) {
   const [opened, setOpened] = useWLState(expanded);
   const [savingSummary, setSavingSummary] = useWLState(false);
   const [noteDraft, setNoteDraft] = useWLState(false);
@@ -570,7 +577,7 @@ function WlItemRow({ item, expanded, onToggle, live, busy, checking, checkBusy, 
       </div>
       <WlTrendDetail item={item} source={source} checking={checking} checkBusy={checkBusy} onCheck={onCheck} />
       <WlTokenSection item={item} expanded={expanded} checking={checking} busy={busy} copied={copied}
-        onCopy={copyContract} onDelete={onDelete} />
+        onCopy={copyContract} onDelete={onDelete} onGone={onGone} />
     </div>}
   </div>;
 }
@@ -857,6 +864,7 @@ function WatchListScreen({ hideValues, refreshTrigger }) {
     const at = document.activeElement;
     const moveFocus = !at || at === document.body || !!(row && row.contains(at));
     deletedRef.current[key] = true;
+    wlDropDraft(key);                                          // Landing 93: its unsaved note draft goes too
     if (res.status === 200 && mutationsRef.current === seen) applyList(res);
     else {                                                     // 404 (already deleted in another window), or another reply
       mutationsRef.current += 1;                               // changed the list while this ran: only this token leaves
@@ -877,6 +885,18 @@ function WatchListScreen({ hideValues, refreshTrigger }) {
       if (el && el.focus) el.focus();
     }, 0);
     return { ok: true };
+  }
+
+  // Landing 93: the delete question found the token already deleted (404, another window). Like deleteItem's 404 branch the
+  // row leaves at once and its draft goes; the list is then read again, so a token that does exist comes back.
+  function tokenGone(key) {
+    const it = items.find(i => i.key === key);
+    showFlash((it ? it.name : 'The token') + ' was already deleted, maybe in another window.');
+    wlDropDraft(key);
+    mutationsRef.current += 1;                                 // a list reply still on its way no longer applies
+    setState(prev => (prev.status !== 'ok' ? prev
+      : { status: 'ok', data: { ...prev.data, items: prev.data.items.filter(i => i.key !== key) } }));
+    load();
   }
 
   async function addItem(body) {
@@ -914,7 +934,8 @@ function WatchListScreen({ hideValues, refreshTrigger }) {
     checkBusy={!!checking} notice={notices[item.key] || ''} limits={limits} hideValues={hideValues}
     draftRaw={drafts[item.key]} onDraft={(v, same) => setDraftFor(item.key, v, same)}
     onPatch={body => patchItem(item.key, body)} onCheck={() => checkTrend(item.key)} onDismiss={() => setNotice(item.key, '')}
-    onDelete={(keepIds, stamp) => deleteItem(item.key, keepIds, stamp)} />;
+    onDelete={(keepIds, stamp) => deleteItem(item.key, keepIds, stamp)}
+    onGone={() => tokenGone(item.key)} />;
 
   return <div className="wl-page">
     <div className="wl-top">

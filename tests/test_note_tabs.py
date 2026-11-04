@@ -953,6 +953,38 @@ def test_the_preview_stamp_guards_against_a_change_in_between(client, db):
     assert r.status_code == 200 and r.get_json()["note_versions"] == 2
 
 
+def test_a_note_saved_while_the_preview_was_being_worked_out_makes_the_delete_a_409(client, db, monkeypatch):
+    """Landing 93: the stamp is read before the counts. A save that lands between the two reads leaves the stamp
+    older than the state, so the delete that uses it is refused (read in the other order, the stamp would be new and
+    the counts old, and the delete would pass)."""
+    add(client, "Setups")
+    save(client, "notes-t1", "first")
+    real = wp._watch_delete_plan
+    state = {"first": True}
+
+    def plan_then_a_save_lands(conn, key, keep=frozenset()):
+        out = real(conn, key, keep)
+        if state["first"]:
+            state["first"] = False
+            other = portfolio_db.get_connection()
+            other.execute("INSERT INTO page_notes (page, body_json, body_text, created_at) VALUES (?, ?, ?, 'now')",
+                          (key, json.dumps({"ops": [{"insert": "saved elsewhere" + chr(10)}]}), "saved elsewhere"))
+            other.commit()
+            other.close()
+        return out
+
+    monkeypatch.setattr(wp, "_watch_delete_plan", plan_then_a_save_lands)
+    p = preview(client, "notes-t1").get_json()
+    assert p["note_versions"] == 1                                       # the counts the question shows are the old ones
+    monkeypatch.setattr(wp, "_watch_delete_plan", real)
+    before = counts(db)
+    r = delete(client, "notes-t1", json={"stamp": p["stamp"]})
+    assert r.status_code == 409 and r.get_json()["changed"] is True
+    assert counts(db) == before
+    assert db.execute("SELECT COUNT(*) FROM page_notes WHERE page = 'notes-t1'").fetchone()[0] == 2
+    assert delete(client, "notes-t1", json={"stamp": preview(client, "notes-t1").get_json()["stamp"]}).status_code == 200
+
+
 def test_a_default_tab_without_rows_has_a_stamp(client):
     p = preview(client, "notes-nuggets").get_json()
     assert p["stamp"] == "0:0"
