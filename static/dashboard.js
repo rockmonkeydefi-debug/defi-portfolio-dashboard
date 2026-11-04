@@ -312,6 +312,76 @@ function _dashFinite(v) {
   return v == null || v === '' ? null : _dashNum(v);
 }
 
+/* -- ROW 4: Watch List card (Landing 92; GET /api/watchlist + /api/watchlist/prices) --
+   The first DASH_WATCH_MAX active tokens in the Watch List's own order (High, Medium, Low; the server sorts),
+   each with its priority, name and chain, price, trend dots and most respected timeframe, read with the Watch
+   List page's own helpers (static/watchlist.js: wlTrendSource, wlRespected, wlPriceView, WlTrendDots), so both
+   read the same. The plan summary is the row's hover text, hidden with Hide values (as on the page; prices are
+   not holdings and stay). A token opens the Watch List with that row open and scrolled into view
+   (window.__watchListJump, read once by WatchListScreen). */
+const DASH_WATCH_MAX = 6;
+const DASH_WATCH_PRIO = { high: 'High', medium: 'Med', low: 'Low' };
+
+function _dashWatchModel(watch, nowMs) {
+  if (watch.status !== 'ok') return { status: watch.status };
+  const helpers = typeof wlTrendSource === 'function' && typeof wlRespected === 'function' && typeof wlPriceView === 'function';
+  if (!helpers) return { status: 'error' };
+  const active = (watch.data.items || []).filter(i => i && i.active);
+  return { status: 'ok', more: Math.max(0, active.length - DASH_WATCH_MAX), total: active.length,
+           rows: active.slice(0, DASH_WATCH_MAX).map(item => {
+             const source = wlTrendSource(item);
+             const resp = source ? wlRespected(source.tfs, nowMs) : { cells: {}, best: null };
+             return { item, source, best: resp.best };
+           }) };
+}
+
+function DashWatchCard({ model, prices, hideValues, onOpen, onOpenToken }) {
+  const link = <button type="button" className="dash-link" onClick={onOpen}>{'Open Watch List ' + String.fromCharCode(0x2192)}</button>;
+  const shell = (children) => (
+    <div className="dash-card dash-watch" style={{ padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+        <div className="dash-label">WATCH LIST</div>
+        <div style={{ flex: 1 }} />
+        {link}
+      </div>
+      {children}
+    </div>
+  );
+  const msg = (t) => <div style={{ fontSize: 13, color: 'var(--dash-text3)' }}>{t}</div>;
+  if (model.status === 'loading') return shell(msg(String.fromCharCode(0x2026)));
+  if (model.status !== 'ok') return shell(msg('Watch List unavailable'));
+  if (model.rows.length === 0) return shell(msg('No active tokens on the Watch List yet.'));
+  const live = prices && prices.status === 'ok' ? prices.data : {};
+  return shell(<>
+    <div className="dash-watch-list" role="list" aria-label="Watch List tokens">
+      {model.rows.map(({ item, source, best }) => {
+        const price = wlPriceView(item, live[item.key]);
+        const plan = !hideValues && item.summary ? wlCleanSummary(item.summary) : '';
+        const prio = item.priority || 'medium';
+        const respText = !source ? 'No trend yet' : best
+          ? (WL_TF_LABEL[best.tf] + ' ' + (WL_DIR_LABEL[best.cell.dir] || best.cell.dir)) : 'No respected trend';
+        return (
+          <button key={item.key} type="button" role="listitem" className="dash-watch-row" data-key={item.key}
+            title={plan ? 'Plan: ' + plan : undefined}
+            aria-label={item.name + ' on ' + item.chain_label + ', ' + (DASH_WATCH_PRIO[prio] || prio) + ' priority. Open it on the Watch List'}
+            onClick={() => onOpenToken(item.key)}>
+            <span className={'dash-watch-prio dash-watch-prio--' + prio}>{DASH_WATCH_PRIO[prio] || prio}</span>
+            <span className="dash-watch-name"><span className="dash-watch-sym">{item.name}</span>
+              <span className="dash-watch-chain">{item.chain_label}</span></span>
+            <span className="dash-watch-price dash-num" title={price ? price.note : 'No price yet'}>
+              {price ? <span className={price.live ? '' : 'wl-stale'}>{window.fmtTokenPrice(price.value)}</span>
+                : prices && prices.status === 'loading' ? String.fromCharCode(0x2026) : String.fromCharCode(0x2014)}</span>
+            <span className="dash-watch-dots">{source ? <WlTrendDots tfs={source.tfs} source={source} name={item.name} />
+              : <span style={{ color: 'var(--dash-text4)' }}>{String.fromCharCode(0x2014)}</span>}</span>
+            <span className={'dash-watch-resp' + (best ? '' : ' dash-watch-resp--none')}>{respText}</span>
+          </button>
+        );
+      })}
+    </div>
+    {model.more > 0 && <button type="button" className="dash-link" onClick={onOpen}>{'+' + model.more + ' more'}</button>}
+  </>);
+}
+
 /* ── ROW 1 Right: Lending card (GET /api/portfolio aave_positions) ── */
 // A row counts as a position when collateral or debt is at least $0.01; the
 // health factor comes only from rows reporting one above 0 (Zerion rows carry 0).
@@ -2081,6 +2151,9 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
   const [marketStatus,    setMarketStatus]    = useDashState('loading');
   const [spotStatus,      setSpotStatus]      = useDashState('loading');
   const [historyStatus,   setHistoryStatus]   = useDashState('loading');
+  // Landing 92: the Watch List card ({status, data}: the list, then its live prices).
+  const [watch,       setWatch]       = useDashState({ status: 'loading', data: null });
+  const [watchPrices, setWatchPrices] = useDashState({ status: 'loading', data: {} });
   // Alpha Chasers (GET /api/bittensor/performance): status 'loading' | 'ok' | 'cache_cold' | 'error'.
   const [btPerf,          setBtPerf]          = useDashState({ status: 'loading', data: null });
   // Open perps card (GET /api/trading/perps/open): status 'loading' | 'ok' | 'error'.
@@ -2204,6 +2277,11 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
       load('/api/spot/change-24h', d => setSpotChange(d && d.positions && typeof d.positions === 'object'
         ? { status: 'ok', data: d } : { status: 'error', data: null }), null),
       load('/api/spot/history', d => { setSpotHistory(Array.isArray(d) ? d : []); setHistoryStatus(Array.isArray(d) ? 'ok' : 'error'); }, null),
+      // Landing 92: a failed refresh keeps what the card already shows.
+      load('/api/watchlist', d => setWatch(prev => d && Array.isArray(d.items) ? { status: 'ok', data: d }
+        : prev.status === 'ok' ? prev : { status: 'error', data: null }), null),
+      load('/api/watchlist/prices', d => setWatchPrices(prev => d && d.prices && typeof d.prices === 'object'
+        ? { status: 'ok', data: d.prices } : prev.status === 'ok' ? prev : { status: 'error', data: {} }), null),
     ]);
   }, [fetchTotal, loadBtPerf, loadPerpsOpen]);
 
@@ -2260,6 +2338,17 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
   const tradingModel = _dashTradingModel({ trades: tradesState, perps: perpsOpen, nowMs: Date.now() });
   const hlModel = _dashHlModel(totalState, totalData, Date.now());
   const onOpenSpot = () => { setActiveTab && setActiveTab('spot'); };
+  // Landing 92: open the Watch List, with one token's row open and scrolled into view.
+  const onOpenWatch = () => { setActiveTab && setActiveTab('watchlist'); };
+  const onOpenWatchToken = (key) => {
+    if (typeof wlReadExpanded === 'function' && typeof wlWriteExpanded === 'function') {
+      const open = wlReadExpanded();
+      if (open.indexOf(key) === -1) wlWriteExpanded(open.concat([key]));
+    }
+    window.__watchListJump = key;
+    onOpenWatch();
+  };
+  const watchModel = _dashWatchModel(watch, Date.now());
   const liveTotal = totalState === 'ok' && totalData ? _dashFinite(totalData.total_usd) : null;
   const spotCards = _dashSpotCardsModel(spotPnl, spotChange.data, liveTotal);
   const moversStatus = spotStatus === 'error' || spotChange.status === 'error' ? 'error'
@@ -2300,10 +2389,11 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
         </div>
       </div>
 
-      {/* -- ROW 4: Market + Lending (Landing 91: the MaxFi card is gone) -- */}
+      {/* -- ROW 4: Market + Lending + Watch List (Landing 91 removed MaxFi; Landing 92 added the Watch List) -- */}
       <div className="dash-row4">
         <DashBtcCard snap={marketData?.snapshot || {}} status={marketStatus} />
         <DashLendingCard portfolio={portfolio} status={portfolioStatus} hideValues={hideValues} />
+        <DashWatchCard model={watchModel} prices={watchPrices} hideValues={hideValues} onOpen={onOpenWatch} onOpenToken={onOpenWatchToken} />
       </div>
 
       {/* -- ROW 5: note image storage (Landing 77) -- */}

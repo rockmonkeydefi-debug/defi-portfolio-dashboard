@@ -5,7 +5,7 @@ headless-browser runs.
   not drawn; app.js already opens the Dashboard for a stored hidden tab. The pages themselves stay.
 - static/dashboard.js: no MaxFi card, hero badge or MaxFi requests; the MaxFi LP / fees breakdown rows show only
   when non-zero or warning (the total still counts them). _dashFinite, which sat with the MaxFi card, is kept. The total's math (portfolio_total.py) and the MaxFi backend are untouched.
-- static/style.css: Dashboard row 4 has two columns (Market, Lending).
+- static/style.css: no MaxFi card rules in Dashboard row 4.
 """
 import re
 from pathlib import Path
@@ -71,14 +71,14 @@ def test_the_maxfi_rows_stay_but_show_only_when_non_zero_or_warning():
     assert "const DASH_IDLE_KEYS = ['wallet_tokens', 'stablecoins', 'hyperliquid'];" in js     # no loading placeholders
 
 
-def test_row_four_has_two_columns_and_no_maxfi_rules():
+def test_row_four_has_no_maxfi_card_or_rules():
+    # Landing 92 put the Watch List card in the third slot (tests/test_dashboard_watch_card_wiring.py)
     css = re.sub(r"/[*].*?[*]/", "", _read("static/style.css"), flags=re.S)
-    assert ".dash-row4 { display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:16px; align-items:stretch; }" in css
     assert "#dash-maxfi" not in css and ".dash-maxfi-" not in css
     js = _read("static/dashboard.js")
     row4 = js[js.index('<div className="dash-row4">'):]
     row4 = row4[:row4.index("</div>")]
-    assert "<DashBtcCard " in row4 and "<DashLendingCard " in row4
+    assert "<DashBtcCard " in row4 and "<DashLendingCard " in row4 and "Maxfi" not in row4
 
 
 def test_the_total_and_the_maxfi_backend_are_untouched():

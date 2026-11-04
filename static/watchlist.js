@@ -69,6 +69,7 @@ const WL_CHECK_TIMEOUT_MS = 90000;         // Check trend takes about 20 s on th
 const WL_EXPANDED_KEY = 'watchListExpanded';
 const WL_INACTIVE_KEY = 'watchListInactiveOpen';
 const WL_CHAIN_KEY = 'watchListChain';
+const WL_JUMP_HOLD_MS = 2500;       // Landing 92: how long a row opened from the Dashboard is kept in view while the page settles
 const WL_KEY_RE = /^notes-w[1-9][0-9]{0,5}$/;
 const WL_RESPECT_TFS = ['1d', '12h', '4h', '1h'];       // longest first (TRENDS_RESPECT_TFS)
 const WL_ROW_TFS = ['1w', '1d', '12h', '4h', '1h'];
@@ -652,6 +653,13 @@ function WatchListScreen({ hideValues, refreshTrigger }) {
   const [meterKey, setMeterKey] = useWLState(0);
   const [drafts, setDrafts] = useWLState({});          // key -> summary text being edited
   const [deleting, setDeleting] = useWLState({});      // key -> true while that token's delete is on its way (Landing 87)
+  // Landing 92: the Dashboard's Watch List card sets window.__watchListJump to a token's key (and opens its row in
+  // watchListExpanded) right before switching here; read once, so later visits open as usual.
+  const [jumpKey, setJumpKey] = useWLState(() => {
+    const k = window.__watchListJump;
+    window.__watchListJump = undefined;
+    return typeof k === 'string' && WL_KEY_RE.test(k) ? k : null;
+  });
   const deletedRef = useWLRef({});                     // key -> true for every token this page has deleted (keys are never reused)
   const aliveRef = useWLRef(true);
   const mutationsRef = useWLRef(0);                    // counts the replies that set the list, so an older read can't overwrite them
@@ -672,6 +680,35 @@ function WatchListScreen({ hideValues, refreshTrigger }) {
   useWLEffect(() => { load(); }, [refreshTrigger]);
 
   const items = state.status === 'ok' ? state.data.items : [];
+  // Landing 92: once the list is shown, bring the token the Dashboard asked for into view and put focus on its row.
+  useWLEffect(() => {
+    if (!jumpKey || state.status !== 'ok') return;
+    setJumpKey(null);
+    setExpandedKeys(prev => (prev.indexOf(jumpKey) === -1 ? prev.concat([jumpKey]) : prev));
+    setTimeout(() => {
+      const row = document.querySelector('.wl-row[data-key="' + jumpKey + '"]');
+      if (!row) return;
+      row.scrollIntoView({ block: 'start', behavior: 'auto' });
+      const t = row.querySelector('.wl-toggle');
+      if (t) t.focus({ preventScroll: true });
+      // Open rows above it are still loading their notes and push it down: keep it in place for WL_JUMP_HOLD_MS,
+      // unless you scroll or press a key first.
+      const at = row.getBoundingClientRect().top;
+      let done = false;
+      const stop = () => {
+        if (done) return;
+        done = true;
+        clearInterval(timer);
+        ['wheel', 'touchstart', 'keydown', 'mousedown'].forEach(ev => window.removeEventListener(ev, stop, true));
+      };
+      ['wheel', 'touchstart', 'keydown', 'mousedown'].forEach(ev => window.addEventListener(ev, stop, true));
+      const started = Date.now();
+      const timer = setInterval(() => {
+        if (!row.isConnected || Date.now() - started > WL_JUMP_HOLD_MS) { stop(); return; }
+        if (Math.abs(row.getBoundingClientRect().top - at) > 4) row.scrollIntoView({ block: 'start', behavior: 'auto' });
+      }, 100);
+    }, 0);
+  }, [jumpKey, state.status]);
   const activeKeys = items.filter(i => i.active).map(i => i.key).join(',');
   const allKeys = items.map(i => i.key).join(',');
 
