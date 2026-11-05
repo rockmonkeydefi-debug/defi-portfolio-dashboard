@@ -9643,69 +9643,75 @@ def api_trading_perps_open():
     {"open_count", "notional", "unrealized", "if_stopped", "no_stop_count"};
     "venues": [{"venue", "status" (ok / loading / error), "as_of", "error"}]}."""
     try:
-        from decimal import Decimal
-        now = datetime.now(timezone.utc)
-        try:
-            _maybe_kick_hl_accounts_refresh(now)
-        except Exception as e:
-            print(f"[hl-accounts] open-perps kick failed {e!r}", flush=True)
-        config = load_wallet_config()
-        tx_wallets = _txflow_wallets(config)
-        tx_set = {a.lower() for a in tx_wallets}
-        if tx_wallets:
-            try:
-                _maybe_kick_txflow_refresh(now)
-            except Exception as e:
-                print(f"[txflow] open-perps kick failed {e!r}", flush=True)
-        state = _hl_accounts_cache_copy()
-        label_of = lambda a: (_txflow_label(a, config, tx_wallets) if a.lower() in tx_set
-                              else _hl_trades_label(a, config))
-        # Error texts can quote an address (e.g. "every wallet failed: <addr>:
-        # ..."); every address in them is replaced by that wallet's label.
-        scrub = lambda t: (re.sub(r'0x[0-9a-fA-F]{40}', lambda m: label_of(m.group(0)), str(t))
-                           if t else None)
-        positions = []
-        for addr, w in sorted((state.get("wallets") or {}).items()):
-            w = w or {}
-            # Landing 66: every live take-profit per position (nearest first), for the
-            # card's price bar; None when the open orders could not be read.
-            tps = hl_trades.take_profits(w.get("positions") or [], w.get("open_orders"))
-            for row in hl_trades.open_position_rows(w.get("positions") or [], w.get("open_orders")):
-                row.update({"venue": "Hyperliquid", "wallet_label": _hl_trades_label(addr, config),
-                            "stale": bool(w.get("stale")), "open_orders_error": scrub(w.get("open_orders_error")),
-                            "take_profits": tps.get(row["coin"])})
-                positions.append(row)
-        tx_state = _txflow_cache_copy() if tx_wallets else None
-        if tx_wallets:
-            for addr, w in sorted((tx_state.get("wallets") or {}).items()):
-                if addr.lower() not in tx_set:
-                    continue
-                w = w or {}
-                tps = txflow.take_profits(w.get("state"))
-                for row in txflow.open_position_rows(w.get("state")):
-                    row.update({"venue": "TxFlow", "wallet_label": label_of(addr),
-                                "stale": bool(w.get("stale")), "open_orders_error": None,
-                                "take_profits": tps.get(row["coin"])})
-                    positions.append(row)
-        positions.sort(key=lambda r: (r["position_value"] is None,
-                                      -Decimal(r["position_value"]) if r["position_value"] is not None else 0))
-        q = lambda x: str(x.quantize(Decimal("0.000001")))
-        total = lambda k: q(sum((Decimal(r[k]) for r in positions if r[k] is not None), Decimal(0)))
-        totals = {"open_count": len(positions), "notional": total("position_value"),
-                  "unrealized": total("unrealized_pnl"), "if_stopped": total("if_stopped_pnl"),
-                  "no_stop_count": sum(1 for r in positions
-                                       if "no_stop" in r["flags"] or "open_orders_unavailable" in r["flags"])}
-        venues = [{"venue": "Hyperliquid",
-                   "status": "ok" if state.get("fetched_at") else ("error" if state.get("error") else "loading"),
-                   "as_of": state.get("fetched_at"), "error": scrub(state.get("error"))}]
-        if tx_wallets:
-            venues.append({"venue": "TxFlow",
-                           "status": "ok" if tx_state.get("fetched_at") else ("error" if tx_state.get("error") else "loading"),
-                           "as_of": tx_state.get("fetched_at"), "error": scrub(tx_state.get("error"))})
-        return jsonify({"positions": positions, "totals": totals, "venues": venues})
+        return jsonify(_perps_open_payload())
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': str(e)}), 500
+
+
+def _perps_open_payload():
+    """The body of GET /api/trading/perps/open as a dict (Landing 95: also read by the Telegram Perps Summary,
+    from the scheduler thread, so no Flask request or response here). Cache-only, as the route documents."""
+    from decimal import Decimal
+    now = datetime.now(timezone.utc)
+    try:
+        _maybe_kick_hl_accounts_refresh(now)
+    except Exception as e:
+        print(f"[hl-accounts] open-perps kick failed {e!r}", flush=True)
+    config = load_wallet_config()
+    tx_wallets = _txflow_wallets(config)
+    tx_set = {a.lower() for a in tx_wallets}
+    if tx_wallets:
+        try:
+            _maybe_kick_txflow_refresh(now)
+        except Exception as e:
+            print(f"[txflow] open-perps kick failed {e!r}", flush=True)
+    state = _hl_accounts_cache_copy()
+    label_of = lambda a: (_txflow_label(a, config, tx_wallets) if a.lower() in tx_set
+                          else _hl_trades_label(a, config))
+    # Error texts can quote an address (e.g. "every wallet failed: <addr>:
+    # ..."); every address in them is replaced by that wallet's label.
+    scrub = lambda t: (re.sub(r'0x[0-9a-fA-F]{40}', lambda m: label_of(m.group(0)), str(t))
+                       if t else None)
+    positions = []
+    for addr, w in sorted((state.get("wallets") or {}).items()):
+        w = w or {}
+        # Landing 66: every live take-profit per position (nearest first), for the
+        # card's price bar; None when the open orders could not be read.
+        tps = hl_trades.take_profits(w.get("positions") or [], w.get("open_orders"))
+        for row in hl_trades.open_position_rows(w.get("positions") or [], w.get("open_orders")):
+            row.update({"venue": "Hyperliquid", "wallet_label": _hl_trades_label(addr, config),
+                        "stale": bool(w.get("stale")), "open_orders_error": scrub(w.get("open_orders_error")),
+                        "take_profits": tps.get(row["coin"])})
+            positions.append(row)
+    tx_state = _txflow_cache_copy() if tx_wallets else None
+    if tx_wallets:
+        for addr, w in sorted((tx_state.get("wallets") or {}).items()):
+            if addr.lower() not in tx_set:
+                continue
+            w = w or {}
+            tps = txflow.take_profits(w.get("state"))
+            for row in txflow.open_position_rows(w.get("state")):
+                row.update({"venue": "TxFlow", "wallet_label": label_of(addr),
+                            "stale": bool(w.get("stale")), "open_orders_error": None,
+                            "take_profits": tps.get(row["coin"])})
+                positions.append(row)
+    positions.sort(key=lambda r: (r["position_value"] is None,
+                                  -Decimal(r["position_value"]) if r["position_value"] is not None else 0))
+    q = lambda x: str(x.quantize(Decimal("0.000001")))
+    total = lambda k: q(sum((Decimal(r[k]) for r in positions if r[k] is not None), Decimal(0)))
+    totals = {"open_count": len(positions), "notional": total("position_value"),
+              "unrealized": total("unrealized_pnl"), "if_stopped": total("if_stopped_pnl"),
+              "no_stop_count": sum(1 for r in positions
+                                   if "no_stop" in r["flags"] or "open_orders_unavailable" in r["flags"])}
+    venues = [{"venue": "Hyperliquid",
+               "status": "ok" if state.get("fetched_at") else ("error" if state.get("error") else "loading"),
+               "as_of": state.get("fetched_at"), "error": scrub(state.get("error"))}]
+    if tx_wallets:
+        venues.append({"venue": "TxFlow",
+                       "status": "ok" if tx_state.get("fetched_at") else ("error" if tx_state.get("error") else "loading"),
+                       "as_of": tx_state.get("fetched_at"), "error": scrub(tx_state.get("error"))})
+    return {"positions": positions, "totals": totals, "venues": venues}
 
 
 @app.route('/api/wallets', methods=['GET'])
@@ -11125,13 +11131,342 @@ def api_telegram_config_save():
     return jsonify(dict(_telegram_config_view(new), status="success"))
 
 
-def _telegram_build_message(kind, now_utc=None):
-    """The text of one message type (HTML, dynamic parts escaped). Used by the scheduler and the test route."""
+def _telegram_build_message(kind, now_utc=None, test=False):
+    """The text of one message type (HTML, dynamic parts escaped). Used by the scheduler and the test route.
+    test: a Send test; it must not move the Watch List's stored baseline."""
     if kind == "portfolio_value":
         return _telegram_portfolio_value_text(now_utc)
+    if kind == "perps_summary":
+        return _telegram_perps_summary_text(now_utc)
+    if kind == "watch_list":
+        return _telegram_watch_list_text(now_utc, save=not test)
     if kind == "risk_gate":
         return _telegram_risk_gate_text()
     raise ValueError(f"Unknown message type: {kind}")
+
+
+def _telegram_num(v):
+    """A float from a number or a numeric string; None when missing or unreadable."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _telegram_price(v):
+    """A price for a message: 2 decimals from 1 up, else 4 significant digits (small coins)."""
+    if v >= 1:
+        return "${:,.2f}".format(v)
+    if v <= 0:
+        return "$0"
+    return "${:.{}f}".format(v, max(4, 3 - math.floor(math.log10(v))))
+
+
+def _telegram_perps_summary_text(now_utc=None):
+    """Perps Summary (ruled Nov 4, 3 D and 4 B; Nov 5 "your recs"). Open positions come from the Open Perps
+    card's data (_perps_open_payload: every live position, venue caches refreshed every 15 minutes); R and
+    the closed trades from the Trade Log (_trades_build). Per open position: P&L in USD, P&L on margin
+    (unrealized / margin_used), R = unrealized / (|average entry - the trade's stop| x peak size) when the
+    position matches an open Trade Log trade with a stop (same venue, wallet label, coin and direction),
+    and the live stop's distance from the mark. Then trades closed in the last 24 hours (net P&L, R)."""
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    from src.storage.portfolio_db import get_connection
+    from src.engines.telegram_service import html_escape
+    now_utc = now_utc or _dt.now(_tz.utc)
+    payload = _perps_open_payload()
+    conn = get_connection()
+    try:
+        trades, _ann = _trades_build(conn)
+    finally:
+        conn.close()
+    lines = ["<b>Perps Summary</b>"]
+    venues = payload.get("venues") or []
+    not_ready = [v["venue"] for v in venues if v.get("status") != "ok"]
+    open_trades = {}
+    for t in trades:
+        if t.get("market") == "perp" and t.get("status") == "open":
+            open_trades.setdefault((t.get("venue"), t.get("wallet_label"), t.get("symbol"), t.get("direction")), t)
+    positions = payload.get("positions") or []
+    if not positions:
+        lines.append("No open positions." if not not_ready
+                     else "No open positions read yet (" + html_escape(", ".join(not_ready)) + " not loaded).")
+    for p in positions:
+        coin, direction = p.get("coin"), p.get("direction")
+        head = html_escape("{} {} \u00b7 {}".format(coin, direction, p.get("venue")))
+        if p.get("wallet_label"):
+            head += " (" + html_escape(p["wallet_label"]) + ")"
+        if p.get("stale"):
+            head += " [stale]"
+        lines.append("<b>" + head + "</b>")
+        upnl = _telegram_num(p.get("unrealized_pnl"))
+        margin = _telegram_num(p.get("margin_used"))
+        parts = []
+        if upnl is None:
+            parts.append("P&amp;L: n/a")
+        else:
+            pnl = "P&amp;L: " + html_escape(_telegram_signed_money(upnl))
+            if margin:
+                pnl += " ({:+.1f}% on margin)".format(upnl / margin * 100)
+            parts.append(pnl)
+        t = open_trades.get((p.get("venue"), p.get("wallet_label"), coin, direction))
+        stop = (t or {}).get("stop") or {}
+        entry, peak, spx = (_telegram_num((t or {}).get("avg_entry")), _telegram_num((t or {}).get("size_peak")),
+                            _telegram_num(stop.get("px")))
+        if t is None:
+            parts.append("not in the Trade Log yet")
+        elif spx is None:
+            parts.append("no stop set")
+        elif upnl is not None and entry is not None and peak:
+            risk = abs(entry - spx) * peak
+            if risk:
+                parts.append("{:+.2f}R".format(upnl / risk))
+        lines.append("  " + " \u00b7 ".join(parts))
+        dist = _telegram_num(p.get("stop_distance_pct"))
+        flags = p.get("flags") or []
+        if "open_orders_unavailable" in flags:
+            lines.append("  Stop: couldn't read the venue's orders")
+        elif "no_stop" in flags or dist is None:
+            lines.append("  Stop: none on the venue")
+        else:
+            lines.append("  Stop: {:.1f}% away".format(abs(dist)) + (" (covers part of the position)" if "stop_partial" in flags else ""))
+    if positions and not_ready:
+        lines.append(html_escape(", ".join(not_ready)) + " not loaded yet: its positions may be missing.")
+    since = now_utc - _td(hours=24)
+    closed = []
+    for t in trades:
+        ms = t.get("_close_ms")
+        if t.get("market") != "perp" or t.get("status") != "closed" or not isinstance(ms, (int, float)):
+            continue
+        at = _dt.fromtimestamp(ms / 1000, _tz.utc)
+        if since <= at <= now_utc:
+            closed.append((at, t))
+    lines.append("<b>Closed in the last 24h</b>")
+    if not closed:
+        lines.append("  None.")
+    for at, t in sorted(closed, key=lambda x: x[0]):
+        net = _telegram_num(t.get("net_pnl"))
+        r = _telegram_num(t.get("r_multiple"))
+        lines.append("  " + html_escape("{} {}".format(t.get("symbol"), t.get("direction"))) + ": "
+                     + (html_escape(_telegram_signed_money(net)) if net is not None else "n/a")
+                     + (" ({:+.2f}R)".format(r) if r is not None else ""))
+    return "\n".join(lines)
+
+
+# Landing 95: the Watch List message's respected label, ported from the page (_trendsRespectCell in
+# static/trends.js, wlRespected in static/watchlist.js). tests/test_telegram_watch_perps.py pins these
+# constants against the page's, so a change on one side fails the tests until the other follows.
+WATCH_MSG_RESPECT_MIN_TAGS = 2
+WATCH_MSG_RESPECT_WINDOW_BARS = 30
+WATCH_MSG_RESPECT_MAX_LOSSES = 1
+WATCH_MSG_RESPECT_TFS = ('1d', '12h', '4h', '1h')        # longest first
+WATCH_MSG_RESPECT_TF_SECONDS = {'1d': 86400, '12h': 43200, '4h': 14400, '1h': 3600}
+WATCH_MSG_DOT_TFS = (('4h', '4H'), ('12h', '12H'), ('1d', '1D'), ('1w', '1W'))   # SPOT_TREND_TFS
+WATCH_MSG_ROW_TFS = ('1w', '1d', '12h', '4h', '1h')                              # WL_ROW_TFS
+WATCH_MSG_POS_WORD = {'above': 'above', 'touch': 'touching', 'below': 'below'}
+WATCH_MSG_PRICE_MOVE_PCT = 5.0        # ruled Nov 5 (3 A): a move of 5% or more since the last message
+TELEGRAM_WATCH_STATE_PATH = os.path.join("data", "telegram_watch_state.json")
+# A scheduled build's state waits here until its send succeeds (_telegram_after_send); a test never adds to it.
+_TELEGRAM_PENDING_STATE = {}
+
+
+def _telegram_after_send(kind):
+    """Called by the scheduler after a message type went out: keep that build's pending state."""
+    from src.engines.telegram_service import _atomic_write_json
+    st = _TELEGRAM_PENDING_STATE.pop(kind, None)
+    if kind == "watch_list" and st is not None:
+        _atomic_write_json(TELEGRAM_WATCH_STATE_PATH, st)
+
+
+def _watch_respect_cell(r, tf):
+    """_trendsRespectCell for one row: None, {"status": "ranging"} or {"status": "pass" | "stale", "dir",
+    "tags"}. Only what the message shows; the rules are the page's."""
+    from maxfi_advisor import parse_utc
+    if not r or not isinstance(r.get("computed_at"), str):
+        return None
+    dt = parse_utc(r["computed_at"])
+    if dt is None:
+        return None
+    tf_sec = WATCH_MSG_RESPECT_TF_SECONDS[tf]
+    computed = dt.timestamp()
+    last_closed_open = math.floor(computed / tf_sec) * tf_sec - tf_sec
+    num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
+    if r.get("respect_dir") is None:
+        if not num(r.get("respect_ranging_since")):
+            return None
+        flat = max(0, round((last_closed_open - r["respect_ranging_since"]) / tf_sec))
+        return None if flat >= WATCH_MSG_RESPECT_WINDOW_BARS else {"status": "ranging"}
+    if r.get("respect_dir") not in ("BULLISH", "BEARISH"):
+        return None
+    if not num(r.get("respect_since")):
+        return None
+    if not num(r.get("respect_tags")) or r["respect_tags"] < WATCH_MSG_RESPECT_MIN_TAGS:
+        return None
+    if not num(r.get("respect_losses")) or r["respect_losses"] > WATCH_MSG_RESPECT_MAX_LOSSES:
+        return None
+    if not num(r.get("respect_last_ts")):
+        return None
+    bars_ago = max(0, round((last_closed_open - r["respect_last_ts"]) / tf_sec))
+    return {"status": "pass" if bars_ago < WATCH_MSG_RESPECT_WINDOW_BARS else "stale",
+            "dir": r["respect_dir"], "tags": r["respect_tags"]}
+
+
+def _watch_respected_label(tfs):
+    """wlRespected's choice as text: the passing timeframe with the most tags (the longer one on a tie),
+    e.g. "Respected 1D Bullish (3 tags)"; else "No respected trend"."""
+    best = None
+    for tf in WATCH_MSG_RESPECT_TFS:
+        cell = _watch_respect_cell((tfs or {}).get(tf), tf)
+        if cell and cell["status"] == "pass" and (best is None or cell["tags"] > best[1]["tags"]):
+            best = (tf, cell)
+    if best is None:
+        return "No respected trend"
+    tf, cell = best
+    word = {"BULLISH": "Bullish", "BEARISH": "Bearish"}[cell["dir"]]
+    return "Respected {} {} ({} tag{})".format(tf.upper(), word, cell["tags"], "" if cell["tags"] == 1 else "s")
+
+
+def _watch_trend_source(item):
+    """wlTrendSource: the Trends scanner's rows or the saved Check trend's, whichever is newer; None
+    when neither has a row."""
+    from maxfi_advisor import parse_utc
+    has = lambda tfs: bool(tfs) and any(tfs.get(tf) for tf in WATCH_MSG_ROW_TFS)
+    sc, ck = item.get("scanner"), item.get("check")
+    sc = sc if sc and has(sc.get("timeframes")) else None
+    ck = ck if ck and has(ck.get("timeframes")) else None
+    if sc and ck:
+        s, c = parse_utc(sc.get("as_of")), parse_utc(ck.get("computed_at"))
+        return ck["timeframes"] if c is not None and (s is None or c > s) else sc["timeframes"]
+    return (sc or ck or {}).get("timeframes")
+
+
+def _watch_item_price(item, live):
+    """wlPriceView's value as (price, source): the live DexScreener price ("live"), else the scanner's
+    latest row price, not for a kilo market ("scanner"), else the saved check's price ("check");
+    (None, None) when there is none."""
+    if isinstance(live, (int, float)):
+        return float(live), "live"
+    sc = item.get("scanner")
+    if sc and sc.get("timeframes") and str(sc.get("scanner_symbol")).upper() == str(item.get("name")).strip().upper():
+        for tf in ('1h', '4h', '12h', '1d', '1w'):
+            r = sc["timeframes"].get(tf)
+            if r and isinstance(r.get("price"), (int, float)):
+                return float(r["price"]), "scanner"
+    ck = item.get("check")
+    if ck and isinstance(ck.get("price"), (int, float)):
+        return float(ck["price"]), "check"
+    return None, None
+
+
+def _watch_live_prices(active):
+    """Live USD prices for the given items (the /api/watchlist/prices path: fetch_dexscreener_price, at
+    most WATCH_PRICE_WORKERS at once, WATCH_PRICE_TIMEOUT_S in all). {key: price or None}."""
+    import concurrent.futures
+    prices = {i["key"]: None for i in active}
+    if not active:
+        return prices
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=WATCH_PRICE_WORKERS)
+    try:
+        futures = {pool.submit(fetch_dexscreener_price, i["contract"],
+                               (SPOT_CHAINS.get(i["chain"]) or {}).get("dexscreener_slug", i["chain"])): i["key"]
+                   for i in active}
+        try:
+            for fut in concurrent.futures.as_completed(futures, timeout=WATCH_PRICE_TIMEOUT_S):
+                try:
+                    p = fut.result()
+                except Exception:
+                    p = None
+                prices[futures[fut]] = p if isinstance(p, (int, float)) and math.isfinite(p) and p > 0 else None
+        except concurrent.futures.TimeoutError:
+            pass
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    return prices
+
+
+def _telegram_watch_state_load():
+    try:
+        with open(TELEGRAM_WATCH_STATE_PATH, "r") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) and isinstance(data.get("items"), dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _telegram_watch_list_text(now_utc=None, save=True):
+    """Watch List (ruled Nov 5: what changed first, then every Active token; Active only). For each Active
+    token, in the page's order: name, chain, price, where the price sits against the noodle on 4H / 12H /
+    1D / 1W (the page's dots) and the respected label. "Changed" compares with the state stored by the
+    last scheduled Watch List message (TELEGRAM_WATCH_STATE_PATH): a dot that moved, a respected label
+    that changed, a price move of WATCH_MSG_PRICE_MOVE_PCT or more (same price source only), a token new to
+    the list. save=True leaves the new state pending until the send succeeds (_telegram_after_send); a
+    Send test (save=False) leaves everything alone."""
+    from datetime import datetime as _dt, timezone as _tz
+    from src.storage.portfolio_db import get_connection
+    from src.engines.telegram_service import html_escape
+    now_utc = now_utc or _dt.now(_tz.utc)
+    conn = get_connection()
+    try:
+        view = _watch_view(conn)
+    finally:
+        conn.close()
+    active = [i for i in view["items"] if i["active"]]
+    live = _watch_live_prices(active)
+    prev = _telegram_watch_state_load()
+    rows, state = [], {}
+    for i in active:
+        tfs = _watch_trend_source(i)
+        pos = {tf: ((tfs or {}).get(tf) or {}).get("position") for tf, _l in WATCH_MSG_DOT_TFS}
+        label = _watch_respected_label(tfs)
+        price, source = _watch_item_price(i, live.get(i["key"]))
+        rows.append((i, pos, label, price, source))
+        # A value missing today keeps the last one seen, so a gap day never hides the next change.
+        old = (prev or {}).get("items", {}).get(i["key"]) if prev else None
+        old = old if isinstance(old, dict) else {}
+        keep_pos = {tf: (pos[tf] if pos[tf] else (old.get("positions") or {}).get(tf)) for tf in pos}
+        keep_price = (price, source) if price is not None else (old.get("price"), old.get("price_source"))
+        state[i["key"]] = {"name": i["name"], "positions": keep_pos, "respected": label,
+                           "price": keep_price[0], "price_source": keep_price[1]}
+    lines = ["<b>Watch List</b>"]
+    if prev is None:
+        lines.append("First Watch List message: nothing to compare yet.")
+    else:
+        changes = []
+        for i, pos, label, price, source in rows:
+            old = prev["items"].get(i["key"])
+            name = html_escape(i["name"])
+            if not isinstance(old, dict):
+                changes.append(name + ": new on the list")
+                continue
+            for tf, tl in WATCH_MSG_DOT_TFS:
+                a, b = (old.get("positions") or {}).get(tf), pos.get(tf)
+                if a and b and a != b:
+                    changes.append("{}: {} {} \u2192 {}".format(name, tl, WATCH_MSG_POS_WORD.get(a, a), WATCH_MSG_POS_WORD.get(b, b)))
+            if old.get("respected") and old["respected"] != label:
+                changes.append(name + ": " + html_escape(label) + " (was " + html_escape(old["respected"]) + ")")
+            op = old.get("price")
+            # Only like with like: a live price against a live one, a stored one against the same store.
+            if (isinstance(op, (int, float)) and op > 0 and price is not None
+                    and old.get("price_source", "live") == source):
+                move = (price - op) / op * 100
+                if abs(move) >= WATCH_MSG_PRICE_MOVE_PCT:
+                    changes.append("{}: price {:+.1f}%".format(name, move))
+        lines.append("<b>Changed since the last message</b>")
+        if changes:
+            lines.extend("  " + c for c in changes)
+        else:
+            lines.append("  Nothing.")
+    lines.append("<b>Active ({})</b>".format(len(rows)))
+    if not rows:
+        lines.append("  No Active tokens.")
+    for i, pos, label, price, source in rows:
+        dots = " ".join(tl + " " + (WATCH_MSG_POS_WORD.get(pos[tf]) or "n/a") for tf, tl in WATCH_MSG_DOT_TFS)
+        lines.append("  <b>" + html_escape(i["name"]) + "</b> \u00b7 " + html_escape(i["chain_label"]) + " \u00b7 "
+                     + (html_escape(_telegram_price(price)) if price is not None else "no price"))
+        lines.append("    " + dots + " \u00b7 " + html_escape(label))
+    if save:
+        _TELEGRAM_PENDING_STATE["watch_list"] = {"at": now_utc.isoformat(), "items": state}
+    return "\n".join(lines)
 
 
 def _telegram_money(v):
@@ -12655,7 +12990,7 @@ def _spawn_telegram_messages_thread():
     imports web_portfolio (run as a script, that import would load a second copy with its own scheduler).
     Tests replace this with a no-op (conftest)."""
     from src.engines.telegram_service import messages_loop
-    threading.Thread(target=messages_loop, args=(_telegram_build_message,), daemon=True,
+    threading.Thread(target=messages_loop, args=(_telegram_build_message, _telegram_after_send), daemon=True,
                      name='telegram-messages').start()
 
 
@@ -16279,7 +16614,6 @@ def api_watchlist_prices():
     price or null}, "as_of"}. At most WATCH_PRICE_WORKERS lookups at once and
     WATCH_PRICE_TIMEOUT_S seconds in all (the page gives up at 20); a price not
     back by then is null."""
-    import concurrent.futures
     try:
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
@@ -16287,23 +16621,7 @@ def api_watchlist_prices():
             active = [i for i in _watch_ordered(_watch_items_all(conn)) if i["active"]]
         finally:
             conn.close()
-        prices = {i["key"]: None for i in active}
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=WATCH_PRICE_WORKERS)
-        try:
-            futures = {pool.submit(fetch_dexscreener_price, i["contract"],
-                                   (SPOT_CHAINS.get(i["chain"]) or {}).get("dexscreener_slug", i["chain"])): i["key"]
-                       for i in active}
-            try:
-                for fut in concurrent.futures.as_completed(futures, timeout=WATCH_PRICE_TIMEOUT_S):
-                    try:
-                        p = fut.result()
-                    except Exception:
-                        p = None
-                    prices[futures[fut]] = p if isinstance(p, (int, float)) and math.isfinite(p) and p > 0 else None
-            except concurrent.futures.TimeoutError:
-                pass
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
+        prices = _watch_live_prices(active)
         return jsonify({"prices": prices, "as_of": _note_now()})
     except Exception as e:
         print(traceback.format_exc(), flush=True)
