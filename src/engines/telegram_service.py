@@ -4,52 +4,90 @@ import os
 import re
 import json
 import tempfile
-from datetime import datetime, timezone
+import threading
+from datetime import datetime, timedelta, timezone
 
 import requests
 
 TELEGRAM_CONFIG_PATH = os.path.join("data", "telegram_config.json")
 
+# Landing 94 (Nov 4, Glenn): the Messaging settings hold one entry per message type, each with its own
+# checkbox and a send time typed in Pacific time ("HH:MM", America/Los_Angeles, daylight saving included).
+# The Daily Digest and Market Regime are no longer message types (ruled Nov 4, 1 C); their formatter code
+# below stays, unused. A file written before L94 converts on read: its token, chat id and Enabled carry
+# over, and every message type starts unchecked at DEFAULT_MESSAGE_TIME.
+# MESSAGE_TYPES: (key, label, what it sends), in the order the settings card lists them. Landing 95 adds
+# the Spot and Perps summaries here.
+MESSAGE_TYPES = (
+    ("portfolio_value", "Portfolio Value", "The total portfolio value and its change over 24 hours."),
+    ("risk_gate", "Risk Gate", "Counted perp trades toward the risk gate and its four checks."),
+)
+MESSAGE_TYPE_KEYS = tuple(k for k, _label, _desc in MESSAGE_TYPES)
+DEFAULT_MESSAGE_TIME = "07:00"
+PACIFIC_TZ_NAME = "America/Los_Angeles"
+
 TELEGRAM_CONFIG_DEFAULTS = {
     "bot_token": "",
     "chat_id": "",
-    "schedule_utc_hour": 9,
     "enabled": False,
-    "include_digest": True,
-    "include_regime": True,
 }
 
 _BOT_TOKEN_REGEX = re.compile(r"^\d+:[A-Za-z0-9_-]+$")
+_TIME_REGEX = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
+
+
+def default_messages() -> dict:
+    """Every message type unchecked at DEFAULT_MESSAGE_TIME."""
+    return {k: {"enabled": False, "time": DEFAULT_MESSAGE_TIME} for k in MESSAGE_TYPE_KEYS}
+
+
+def _normalize(data: dict) -> dict:
+    """The stored dict as the current shape: bot_token, chat_id, enabled and messages (every known type, a
+    missing or malformed entry replaced by its default). Keys from before Landing 94 (schedule_utc_hour,
+    include_digest, include_regime, and the page's own utc_hour / content) are dropped."""
+    out = dict(TELEGRAM_CONFIG_DEFAULTS)
+    for k in TELEGRAM_CONFIG_DEFAULTS:
+        if k in data:
+            out[k] = data[k]
+    msgs = default_messages()
+    stored = data.get("messages")
+    if isinstance(stored, dict):
+        for k in MESSAGE_TYPE_KEYS:
+            e = stored.get(k)
+            if (isinstance(e, dict) and isinstance(e.get("enabled"), bool)
+                    and isinstance(e.get("time"), str) and _TIME_REGEX.match(e["time"])):
+                msgs[k] = {"enabled": e["enabled"], "time": e["time"]}
+    out["messages"] = msgs
+    return out
 
 
 def load_telegram_config() -> dict:
-    """Load Telegram configuration from JSON file.
+    """Load Telegram configuration from JSON file, in the current shape (_normalize).
 
     Returns defaults if file is missing or corrupted.
     """
     if not os.path.exists(TELEGRAM_CONFIG_PATH):
-        return dict(TELEGRAM_CONFIG_DEFAULTS)
+        return _normalize({})
     try:
         with open(TELEGRAM_CONFIG_PATH, "r") as f:
             data = json.load(f)
         if not isinstance(data, dict):
             print(f"[Telegram] Config file corrupt (not a dict), using defaults")
-            return dict(TELEGRAM_CONFIG_DEFAULTS)
-        # Merge with defaults so any missing keys get filled in
-        merged = dict(TELEGRAM_CONFIG_DEFAULTS)
-        merged.update(data)
-        return merged
+            return _normalize({})
+        return _normalize(data)
     except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
         print(f"[Telegram] Config file corrupt, using defaults: {e}")
-        return dict(TELEGRAM_CONFIG_DEFAULTS)
+        return _normalize({})
     except (IOError, OSError) as e:
         print(f"[Telegram] Cannot read config file, using defaults: {e}")
-        return dict(TELEGRAM_CONFIG_DEFAULTS)
+        return _normalize({})
 
 
 def validate_telegram_config(data: dict) -> tuple:
     """Validate Telegram configuration fields.
 
+    Body: {"bot_token", "chat_id", "enabled", "messages": {<type>: {"enabled", "time" ("HH:MM", Pacific)}}}.
+    "messages" may leave types out (they keep their defaults); an unknown type or key is refused.
     Returns (True, '') on success, (False, error_message) on failure.
     """
     if not isinstance(data, dict):
@@ -57,49 +95,51 @@ def validate_telegram_config(data: dict) -> tuple:
 
     bot_token = data.get("bot_token", "")
     if not isinstance(bot_token, str) or not _BOT_TOKEN_REGEX.match(bot_token):
-        return (False, "Invalid bot token format")
+        return (False, "Invalid bot token format (paste the whole token from BotFather, no spaces)")
 
     chat_id = data.get("chat_id", "")
     if not isinstance(chat_id, str) or not chat_id.strip():
         return (False, "Chat ID cannot be empty")
 
-    hour = data.get("schedule_utc_hour", 9)
-    if not isinstance(hour, int) or hour < 0 or hour > 23:
-        return (False, "Schedule hour must be 0–23")
-
     enabled = data.get("enabled", False)
     if not isinstance(enabled, bool):
-        return (False, "Enabled must be a boolean")
+        return (False, "Enabled must be true or false")
 
-    include_digest = data.get("include_digest", True)
-    if not isinstance(include_digest, bool):
-        return (False, "include_digest must be a boolean")
-
-    include_regime = data.get("include_regime", True)
-    if not isinstance(include_regime, bool):
-        return (False, "include_regime must be a boolean")
-
-    if enabled and not include_digest and not include_regime:
-        return (False, "At least one content section required when enabled")
+    msgs = data.get("messages", {})
+    if not isinstance(msgs, dict):
+        return (False, "messages must be an object")
+    labels = {k: label for k, label, _d in MESSAGE_TYPES}
+    for k, e in msgs.items():
+        if k not in labels:
+            return (False, f"Unknown message type: {k}")
+        if not isinstance(e, dict) or set(e) - {"enabled", "time"}:
+            return (False, f"{labels[k]}: expected enabled and time")
+        if not isinstance(e.get("enabled"), bool):
+            return (False, f"{labels[k]}: enabled must be true or false")
+        t = e.get("time")
+        if not isinstance(t, str) or not _TIME_REGEX.match(t):
+            return (False, f"{labels[k]}: time must be HH:MM (00:00 to 23:59)")
 
     return (True, "")
 
 
 def save_telegram_config(config: dict) -> None:
-    """Validate and atomically save Telegram configuration to disk."""
+    """Validate and atomically save Telegram configuration to disk, in the current shape."""
     ok, err = validate_telegram_config(config)
     if not ok:
         raise ValueError(err)
+    _atomic_write_json(TELEGRAM_CONFIG_PATH, _normalize(config))
 
-    os.makedirs(os.path.dirname(TELEGRAM_CONFIG_PATH), exist_ok=True)
 
-    # Atomic write: write to temp file then rename
-    dir_name = os.path.dirname(TELEGRAM_CONFIG_PATH)
+def _atomic_write_json(path: str, obj) -> None:
+    """Write obj as JSON to path through a temp file and a rename."""
+    dir_name = os.path.dirname(path)
+    os.makedirs(dir_name, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
-            json.dump(config, f, indent=2)
-        os.replace(tmp_path, TELEGRAM_CONFIG_PATH)
+            json.dump(obj, f, indent=2)
+        os.replace(tmp_path, path)
     except Exception:
         # Clean up temp file on failure
         try:
@@ -641,3 +681,206 @@ def send_daily_notification() -> None:
             raise
 
     print(f"[Telegram] Daily notification sent ({len(messages)} message(s))")
+
+
+# ---------------------------------------------------------------------------
+# Landing 94: scheduled messages (one per message type, each at its own Pacific time)
+# ---------------------------------------------------------------------------
+
+TELEGRAM_SENT_PATH = os.path.join("data", "telegram_sent.json")
+# A send missed by up to this long (a deploy restart at the send time) still goes out; later, that day is
+# skipped (ruled Nov 4, 2 A).
+LATE_SEND_GRACE_SECONDS = 3 * 3600
+
+
+def html_escape(text) -> str:
+    """Text for a parse_mode=HTML message: &, < and > escaped (Telegram's three)."""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def split_message(text: str, limit: int = TELEGRAM_MAX_LENGTH) -> list:
+    """text in pieces of at most `limit` characters, cut at line ends where possible (a single line longer
+    than the limit is cut inside the line)."""
+    if len(text) <= limit:
+        return [text]
+    parts, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if cur:
+                parts.append(cur)
+                cur = ""
+            parts.append(line[:limit])
+            line = line[limit:]
+        cand = line if not cur else cur + "\n" + line
+        if len(cand) > limit:
+            parts.append(cur)
+            cur = line
+        else:
+            cur = cand
+    if cur:
+        parts.append(cur)
+    return parts
+
+
+def pacific_tz():
+    """The America/Los_Angeles zone (the tzdata package backs it where the system has no zone files)."""
+    from zoneinfo import ZoneInfo
+    return ZoneInfo(PACIFIC_TZ_NAME)
+
+
+def load_sent_state() -> dict:
+    """{message type: the Pacific date ("YYYY-MM-DD") of its last scheduled send, sent or skipped}; {} when
+    the file is missing or unreadable."""
+    try:
+        with open(TELEGRAM_SENT_PATH, "r") as f:
+            data = json.load(f)
+        return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_sent_state(state: dict) -> None:
+    _atomic_write_json(TELEGRAM_SENT_PATH, state)
+
+
+_SENT_LOCK = threading.Lock()   # the scheduler and the settings save both update the sent state
+
+
+def _scheduled_instants(e: dict, local: datetime, tz):
+    """(yesterday's, today's) send time for entry e as aware UTC instants, and today's as a Pacific wall clock."""
+    hh, mm = (int(x) for x in e["time"].split(":"))
+    wall = local.replace(tzinfo=None)
+    today_wall = wall.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    yday_wall = today_wall - timedelta(days=1)
+    return (yday_wall.replace(tzinfo=tz).astimezone(timezone.utc),
+            today_wall.replace(tzinfo=tz).astimezone(timezone.utc), today_wall)
+
+
+def due_messages(config: dict, sent: dict, now_utc: datetime) -> list:
+    """What the scheduler does now, as [(type, "send" | "skip", Pacific date to record)]. Pure.
+
+    Nothing while the master Enabled is off. For each checked type, `sent` holds the Pacific date of the
+    last send time it handled (dates compare as text, "YYYY-MM-DD"):
+    - today's time not yet handled and the Pacific wall clock has reached it: "send" if it passed at most
+      LATE_SEND_GRACE_SECONDS ago, else "skip" (a long outage: nothing until tomorrow);
+    - otherwise, yesterday's time not handled and passed at most LATE_SEND_GRACE_SECONDS ago (an outage
+      across Pacific midnight, say a 23:58 time and a restart until 00:01): "send" for yesterday.
+    A save that ticks a type, changes its time or turns messages on marks the send time already passed as
+    handled (arm_after_save), so a change never sends at once. Daylight saving: a time inside the skipped
+    spring hour sends at the first minute after it; in the repeated autumn hour it sends once."""
+    if not config.get("enabled"):
+        return []
+    tz = pacific_tz()
+    local = now_utc.astimezone(tz)
+    today = local.date().isoformat()
+    yday = (local.date() - timedelta(days=1)).isoformat()
+    wall = local.replace(tzinfo=None)
+    out = []
+    for k in MESSAGE_TYPE_KEYS:
+        e = (config.get("messages") or {}).get(k) or {}
+        if not e.get("enabled"):
+            continue
+        last = sent.get(k, "")
+        if last >= today:
+            continue
+        yday_utc, today_utc, today_wall = _scheduled_instants(e, local, tz)
+        if wall >= today_wall:
+            late = (now_utc - today_utc).total_seconds()
+            out.append((k, "send" if late <= LATE_SEND_GRACE_SECONDS else "skip", today))
+        elif last < yday and 0 <= (now_utc - yday_utc).total_seconds() <= LATE_SEND_GRACE_SECONDS:
+            out.append((k, "send", yday))
+    return out
+
+
+def arm_after_save(old: dict, new: dict, now_utc: datetime) -> None:
+    """After a save: for each checked type that was just ticked, had its time changed, or was ticked when
+    messages were turned on, record its most recent passed send time (today's, else yesterday's) as handled,
+    so the change sends nothing until the next send time (ruled: late sends are for outages only)."""
+    tz = pacific_tz()
+    local = now_utc.astimezone(tz)
+    today = local.date().isoformat()
+    yday = (local.date() - timedelta(days=1)).isoformat()
+    wall = local.replace(tzinfo=None)
+    master_on = bool(new.get("enabled")) and not bool(old.get("enabled"))
+    with _SENT_LOCK:
+        sent = load_sent_state()
+        changed = False
+        for k in MESSAGE_TYPE_KEYS:
+            ne = (new.get("messages") or {}).get(k) or {}
+            oe = (old.get("messages") or {}).get(k) or {}
+            if not ne.get("enabled"):
+                continue
+            if not (master_on or not oe.get("enabled") or oe.get("time") != ne.get("time")):
+                continue
+            _y, _t, today_wall = _scheduled_instants(ne, local, tz)
+            mark = today if wall >= today_wall else yday
+            if sent.get(k, "") < mark:
+                sent[k] = mark
+                changed = True
+        if changed:
+            save_sent_state(sent)
+
+
+def send_message_type(config: dict, kind: str, build_fn, timeout: int = 15, test: bool = False) -> int:
+    """Build one message type with build_fn(kind) -> text and send it (split at 4096 characters). Returns
+    how many messages went out. Raises RuntimeError (Telegram's or the network's error, any bot token
+    masked) or ValueError (not configured)."""
+    bot_token = config.get("bot_token", "")
+    chat_id = config.get("chat_id", "")
+    if not bot_token:
+        raise ValueError("No bot token saved. Paste it, then Save.")
+    if not chat_id:
+        raise ValueError("No chat ID saved. Paste it, then Save.")
+    text = build_fn(kind)
+    if test:
+        text = "<i>Test message</i>\n" + text
+    parts = split_message(text)
+    for part in parts:
+        try:
+            send_telegram_message(bot_token, chat_id, part, timeout=timeout)
+        except RuntimeError as exc:
+            from log_redact import redact
+            raise RuntimeError(redact(str(exc)).replace(bot_token, "<redacted>")) from None
+    return len(parts)
+
+
+def run_scheduled_tick(now_utc: datetime, build_fn) -> list:
+    """One scheduler pass: read the settings and the sent state, record each due type's date BEFORE its
+    send (a crash or restart mid-send costs that message, never a second copy), then send. One type
+    failing never stops the others. Returns [(type, action, error or None)]."""
+    config = load_telegram_config()
+    with _SENT_LOCK:
+        sent = load_sent_state()
+        due = due_messages(config, sent, now_utc)
+        for kind, _action, day in due:
+            sent[kind] = day
+        if due:
+            save_sent_state(sent)
+    results = []
+    for kind, action, day in due:
+        if action == "skip":
+            print(f"[Telegram] {kind}: skipped today (send time passed more than 3 hours ago)", flush=True)
+            results.append((kind, "skip", None))
+            continue
+        try:
+            n = send_message_type(config, kind, build_fn)
+            print(f"[Telegram] {kind}: sent ({n} message(s))", flush=True)
+            results.append((kind, "send", None))
+        except Exception as exc:
+            from log_redact import redact
+            err = redact(str(exc))
+            print(f"[Telegram] {kind}: send failed: {err}", flush=True)
+            results.append((kind, "failed", err))
+    return results
+
+
+def messages_loop(build_fn) -> None:
+    """The scheduler thread's body: run_scheduled_tick about once a minute, forever. An error in a pass is
+    logged by its type only (never its text, which could carry the token) and the loop carries on."""
+    import time
+    while True:
+        try:
+            run_scheduled_tick(datetime.now(timezone.utc), build_fn)
+        except Exception as e:
+            print(f"[Telegram] scheduler error: {type(e).__name__}", flush=True)
+        time.sleep(60 - datetime.now(timezone.utc).second)
