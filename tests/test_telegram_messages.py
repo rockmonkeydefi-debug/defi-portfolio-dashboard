@@ -89,9 +89,8 @@ def pt(y, mo, d, h, mi):
 def test_defaults_list_every_type_unchecked_at_seven(files):
     c = tg.load_telegram_config()
     assert c == {"bot_token": "", "chat_id": "", "enabled": False,
-                 "messages": {"portfolio_value": {"enabled": False, "time": "07:00"},
-                              "risk_gate": {"enabled": False, "time": "07:00"}}}
-    assert tg.MESSAGE_TYPE_KEYS == ("portfolio_value", "risk_gate")
+                 "messages": {k: {"enabled": False, "time": "07:00"} for k in tg.MESSAGE_TYPE_KEYS}}
+    assert tg.MESSAGE_TYPE_KEYS == ("portfolio_value", "perps_summary", "watch_list", "risk_gate")    # Landing 95
 
 
 def test_a_file_from_before_landing_94_converts_on_read(files):
@@ -140,7 +139,7 @@ def test_get_masks_the_token_and_lists_the_types(client, files):
     write_cfg(files, cfg())
     j = client.get("/api/settings/telegram").get_json()
     assert j["bot_token"] == "****" + TOKEN[-4:] and TOKEN not in json.dumps(j)
-    assert [t["key"] for t in j["types"]] == ["portfolio_value", "risk_gate"] and j["timezone"] == "Pacific"
+    assert [t["key"] for t in j["types"]] == list(tg.MESSAGE_TYPE_KEYS) and j["timezone"] == "Pacific"
     assert j["messages"]["portfolio_value"] == {"enabled": False, "time": "07:00"}
 
 
@@ -188,7 +187,7 @@ def test_the_test_route_says_what_is_missing(client, files, sent):
 
 def test_the_test_route_sends_that_type_marked_as_a_test(client, files, sent, monkeypatch):
     write_cfg(files, cfg())
-    monkeypatch.setattr(wp, "_telegram_build_message", lambda kind, now_utc=None: "<b>" + kind + "</b>")
+    monkeypatch.setattr(wp, "_telegram_build_message", lambda kind, now_utc=None, test=False: "<b>" + kind + "</b>")
     r = client.post("/api/settings/telegram/test", json={"type": "risk_gate"})
     assert r.status_code == 200 and r.get_json()["message"] == "Test sent (1 message(s))"
     assert sent == [(TOKEN, "42", "<i>Test message</i>\n<b>risk_gate</b>")]
@@ -196,7 +195,7 @@ def test_the_test_route_sends_that_type_marked_as_a_test(client, files, sent, mo
 
 def test_telegrams_error_reaches_the_page_without_the_token(client, files, monkeypatch):
     write_cfg(files, cfg())
-    monkeypatch.setattr(wp, "_telegram_build_message", lambda kind, now_utc=None: "x")
+    monkeypatch.setattr(wp, "_telegram_build_message", lambda kind, now_utc=None, test=False: "x")
 
     def down(token, chat, text, timeout=15):
         raise RuntimeError("Telegram network error: Max retries exceeded with url: /bot" + token + "/sendMessage")
@@ -211,7 +210,7 @@ def test_telegrams_error_reaches_the_page_without_the_token(client, files, monke
 
 def test_a_build_failure_is_500_and_sends_nothing(client, files, sent, monkeypatch):
     write_cfg(files, cfg())
-    monkeypatch.setattr(wp, "_telegram_build_message", lambda kind, now_utc=None: 1 / 0)
+    monkeypatch.setattr(wp, "_telegram_build_message", lambda kind, now_utc=None, test=False: 1 / 0)
     r = client.post("/api/settings/telegram/test", json={"type": "portfolio_value"})
     assert r.status_code == 500 and r.get_json()["error"].startswith("Couldn't build the message") and sent == []
 
@@ -334,7 +333,7 @@ def test_the_date_is_recorded_before_the_send(files, monkeypatch):
     write_cfg(files, cfg(risk_gate={"enabled": True, "time": "07:00"}))
     seen = []
 
-    def build(kind):
+    def build(kind, test=False):
         seen.append(tg.load_sent_state())
         return "x"
 
@@ -350,7 +349,7 @@ def test_the_date_is_recorded_before_the_send(files, monkeypatch):
 def test_one_type_failing_never_stops_the_other(files, sent):
     write_cfg(files, cfg(portfolio_value={"enabled": True, "time": "07:00"}, risk_gate={"enabled": True, "time": "07:00"}))
 
-    def build(kind):
+    def build(kind, test=False):
         if kind == "portfolio_value":
             raise ValueError("no data")
         return "gate"
@@ -362,7 +361,7 @@ def test_one_type_failing_never_stops_the_other(files, sent):
 
 def test_a_skip_is_recorded_and_sends_nothing(files, sent):
     write_cfg(files, cfg(risk_gate={"enabled": True, "time": "07:00"}))
-    assert tg.run_scheduled_tick(pt(2026, 11, 10, 15, 0), lambda k: "x") == [("risk_gate", "skip", None)]
+    assert tg.run_scheduled_tick(pt(2026, 11, 10, 15, 0), lambda k, test=False: "x") == [("risk_gate", "skip", None)]
     assert sent == [] and tg.load_sent_state() == {"risk_gate": "2026-11-10"}
 
 
@@ -381,7 +380,7 @@ def test_escape_and_split():
 
 
 def test_a_long_message_goes_out_in_pieces(files, sent):
-    n = tg.send_message_type(cfg(), "risk_gate", lambda k: "\n".join(["y" * 90] * 100))
+    n = tg.send_message_type(cfg(), "risk_gate", lambda k, test=False: "\n".join(["y" * 90] * 100))
     assert n == len(sent) == 3 and all(len(t) <= tg.TELEGRAM_MAX_LENGTH for _a, _b, t in sent)
 
 
@@ -390,10 +389,10 @@ def test_the_app_starts_one_messages_thread_with_its_own_builder(monkeypatch):
     monkeypatch.undo()                                        # conftest's no-op spawner off: the real one runs
     monkeypatch.setattr(threading.Thread, "start", lambda self: started.append((self.name, self._target, self._args)))
     wp._spawn_telegram_messages_thread()
-    assert started == [("telegram-messages", tg.messages_loop, (wp._telegram_build_message,))]
+    assert started == [("telegram-messages", tg.messages_loop, (wp._telegram_build_message, wp._telegram_after_send))]
     src = open(wp.__file__, encoding="utf-8").read()
     assert "    start_scheduler(_get_portfolio_data_for_snapshot, get_wallet_addresses, compose_total_fn=_compose_total_for_snapshot)\n    _spawn_telegram_messages_thread()\n" in src
-    loop = open(tg.__file__, encoding="utf-8").read().split("def messages_loop(build_fn)", 1)[1]
+    loop = open(tg.__file__, encoding="utf-8").read().split("def messages_loop(build_fn, after_send=None)", 1)[1]
     assert "web_portfolio" not in loop                        # run as a script, that would start a second scheduler
 
 
@@ -477,3 +476,15 @@ def test_portfolio_value_compares_only_with_a_run_20_to_28_hours_earlier(db):
     add_total(db, 31, 900.0, now=now)                                   # 30 h before the latest
     add_total(db, 1, 1100.0, now=now)
     assert "24h: no complete run 20 to 28 hours earlier." in wp._telegram_portfolio_value_text(now.replace(tzinfo=UTC))
+
+
+def test_after_send_runs_only_for_a_scheduled_send_that_went_out(sent, monkeypatch):
+    calls = []
+    tg.send_message_type(cfg(), "watch_list", lambda k, test=False: "x", test=True, after_send=calls.append)
+    assert calls == []                                                      # a test never keeps a baseline
+    tg.send_message_type(cfg(), "watch_list", lambda k, test=False: "x", after_send=calls.append)
+    assert calls == ["watch_list"]
+    monkeypatch.setattr(tg, "send_telegram_message", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")))
+    with pytest.raises(RuntimeError):
+        tg.send_message_type(cfg(), "watch_list", lambda k, test=False: "x", after_send=calls.append)
+    assert calls == ["watch_list"]                                          # a failed send keeps nothing

@@ -16,10 +16,12 @@ TELEGRAM_CONFIG_PATH = os.path.join("data", "telegram_config.json")
 # The Daily Digest and Market Regime are no longer message types (ruled Nov 4, 1 C); their formatter code
 # below stays, unused. A file written before L94 converts on read: its token, chat id and Enabled carry
 # over, and every message type starts unchecked at DEFAULT_MESSAGE_TIME.
-# MESSAGE_TYPES: (key, label, what it sends), in the order the settings card lists them. Landing 95 adds
-# the Spot and Perps summaries here.
+# MESSAGE_TYPES: (key, label, what it sends), in the order the settings card lists them. Landing 95 added
+# the Perps Summary and the Watch List; Landing 96 adds the Spot Summary.
 MESSAGE_TYPES = (
     ("portfolio_value", "Portfolio Value", "The total portfolio value and its change over 24 hours."),
+    ("perps_summary", "Perps Summary", "Each open perp: P&L in USD and on margin, R and stop distance; trades closed in 24 hours."),
+    ("watch_list", "Watch List", "What changed since the last Watch List message, then every Active token."),
     ("risk_gate", "Risk Gate", "Counted perp trades toward the risk gate and its four checks."),
 )
 MESSAGE_TYPE_KEYS = tuple(k for k, _label, _desc in MESSAGE_TYPES)
@@ -821,8 +823,8 @@ def arm_after_save(old: dict, new: dict, now_utc: datetime) -> None:
             save_sent_state(sent)
 
 
-def send_message_type(config: dict, kind: str, build_fn, timeout: int = 15, test: bool = False) -> int:
-    """Build one message type with build_fn(kind) -> text and send it (split at 4096 characters). Returns
+def send_message_type(config: dict, kind: str, build_fn, timeout: int = 15, test: bool = False, after_send=None) -> int:
+    """Build one message type with build_fn(kind, test=...) -> text and send it (split at 4096 characters). Returns
     how many messages went out. Raises RuntimeError (Telegram's or the network's error, any bot token
     masked) or ValueError (not configured)."""
     bot_token = config.get("bot_token", "")
@@ -831,7 +833,8 @@ def send_message_type(config: dict, kind: str, build_fn, timeout: int = 15, test
         raise ValueError("No bot token saved. Paste it, then Save.")
     if not chat_id:
         raise ValueError("No chat ID saved. Paste it, then Save.")
-    text = build_fn(kind)
+    # test=True: the builder must not move any stored baseline (the Watch List's "since the last message").
+    text = build_fn(kind, test=test)
     if test:
         text = "<i>Test message</i>\n" + text
     parts = split_message(text)
@@ -841,10 +844,14 @@ def send_message_type(config: dict, kind: str, build_fn, timeout: int = 15, test
         except RuntimeError as exc:
             from log_redact import redact
             raise RuntimeError(redact(str(exc)).replace(bot_token, "<redacted>")) from None
+    # Landing 95: after every part went out (never for a test), the builder's pending state is kept (the
+    # Watch List's "since the last message" baseline); a failed send leaves the previous baseline in place.
+    if after_send is not None and not test:
+        after_send(kind)
     return len(parts)
 
 
-def run_scheduled_tick(now_utc: datetime, build_fn) -> list:
+def run_scheduled_tick(now_utc: datetime, build_fn, after_send=None) -> list:
     """One scheduler pass: read the settings and the sent state, record each due type's date BEFORE its
     send (a crash or restart mid-send costs that message, never a second copy), then send. One type
     failing never stops the others. Returns [(type, action, error or None)]."""
@@ -863,7 +870,7 @@ def run_scheduled_tick(now_utc: datetime, build_fn) -> list:
             results.append((kind, "skip", None))
             continue
         try:
-            n = send_message_type(config, kind, build_fn)
+            n = send_message_type(config, kind, build_fn, after_send=after_send)
             print(f"[Telegram] {kind}: sent ({n} message(s))", flush=True)
             results.append((kind, "send", None))
         except Exception as exc:
@@ -874,13 +881,13 @@ def run_scheduled_tick(now_utc: datetime, build_fn) -> list:
     return results
 
 
-def messages_loop(build_fn) -> None:
+def messages_loop(build_fn, after_send=None) -> None:
     """The scheduler thread's body: run_scheduled_tick about once a minute, forever. An error in a pass is
     logged by its type only (never its text, which could carry the token) and the loop carries on."""
     import time
     while True:
         try:
-            run_scheduled_tick(datetime.now(timezone.utc), build_fn)
+            run_scheduled_tick(datetime.now(timezone.utc), build_fn, after_send)
         except Exception as e:
             print(f"[Telegram] scheduler error: {type(e).__name__}", flush=True)
         time.sleep(60 - datetime.now(timezone.utc).second)
