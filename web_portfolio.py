@@ -11075,56 +11075,162 @@ def api_ai_models(provider):
 
 
 # --- Telegram Settings Routes ---
+# Landing 94 (Nov 4, Glenn "A,A" / "your recs"): one message per type (MESSAGE_TYPES in telegram_service),
+# each with its own checkbox and Pacific send time, sent by the scheduler (snapshot_service's
+# telegram_messages_loop) and testable one type at a time. The Daily Digest and Market Regime are no longer
+# message types (ruled Nov 4). Error texts reach the page as they are, any bot token masked.
+
+def _telegram_config_view(config):
+    """The settings as the page reads them: the token masked, plus the message types to list."""
+    from src.engines.telegram_service import MESSAGE_TYPES
+    out = dict(config)
+    out["bot_token"] = mask_bot_token(config.get("bot_token", ""))
+    out["types"] = [{"key": k, "label": label, "description": desc} for k, label, desc in MESSAGE_TYPES]
+    out["timezone"] = "Pacific"
+    return out
+
 
 @app.route('/api/settings/telegram', methods=['GET'])
 def api_telegram_config_get():
-    """Get Telegram configuration with masked bot token."""
-    config = load_telegram_config()
-    config["bot_token"] = mask_bot_token(config.get("bot_token", ""))
-    return jsonify(config)
+    """Get Telegram configuration with masked bot token (_telegram_config_view)."""
+    return jsonify(_telegram_config_view(load_telegram_config()))
 
 
 @app.route('/api/settings/telegram', methods=['POST'])
 def api_telegram_config_save():
-    """Validate and save Telegram configuration."""
-    data = request.json
-    if not data:
+    """Validate and save Telegram configuration. Body: {"bot_token", "chat_id", "enabled", "messages":
+    {<type>: {"enabled", "time" ("HH:MM", Pacific)}}}. A masked token (starts with ****) keeps the stored
+    one. 200 with the saved settings (_telegram_config_view); 400 {"error"} for a bad body."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
         return jsonify({"error": "Missing JSON body"}), 400
-    # If the submitted token looks masked (starts with ****), preserve the existing one
-    if data.get("bot_token", "").startswith("****"):
-        existing = load_telegram_config()
-        data["bot_token"] = existing.get("bot_token", "")
+    data = dict(data)
+    token = data.get("bot_token", "")
+    if isinstance(token, str):
+        token = token.strip()
+        data["bot_token"] = token
+        if token.startswith("****"):
+            data["bot_token"] = load_telegram_config().get("bot_token", "")
+    if isinstance(data.get("chat_id"), str):
+        data["chat_id"] = data["chat_id"].strip()
     ok, err = validate_telegram_config(data)
     if not ok:
         return jsonify({"error": err}), 400
+    from src.engines.telegram_service import arm_after_save
+    from datetime import datetime as _dt, timezone as _tz
+    old = load_telegram_config()
     save_telegram_config(data)
-    return jsonify({"status": "success"})
+    new = load_telegram_config()
+    arm_after_save(old, new, _dt.now(_tz.utc))
+    return jsonify(dict(_telegram_config_view(new), status="success"))
+
+
+def _telegram_build_message(kind, now_utc=None):
+    """The text of one message type (HTML, dynamic parts escaped). Used by the scheduler and the test route."""
+    if kind == "portfolio_value":
+        return _telegram_portfolio_value_text(now_utc)
+    if kind == "risk_gate":
+        return _telegram_risk_gate_text()
+    raise ValueError(f"Unknown message type: {kind}")
+
+
+def _telegram_money(v):
+    return ("-" if v < 0 else "") + "${:,.0f}".format(abs(v))
+
+
+def _telegram_signed_money(v):
+    return ("+" if v >= 0 else "-") + "${:,.0f}".format(abs(v))
+
+
+def _telegram_pacific_clock(dt):
+    from src.engines.telegram_service import pacific_tz
+    local = dt.astimezone(pacific_tz())
+    return local.strftime("%b %-d, %-I:%M %p ") + (local.tzname() or "PT")
+
+
+def _telegram_portfolio_value_text(now_utc=None):
+    """Portfolio Value (ruled Nov 4, 2 A): the latest complete total and its change over 24 hours. The runs
+    are the Dashboard equity chart's (portfolio_total_chart.build_chart: completed, every wallet read,
+    Hyperliquid counted, glitch runs left out). The 24h point is the run closest to 24 hours before the
+    latest, only within 20 to 28 hours (as /api/spot/change-24h); across a change of the total's
+    definition the change is not given."""
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    from src.storage.portfolio_db import get_portfolio_total_chart_rows
+    from src.engines.telegram_service import html_escape
+    from maxfi_advisor import parse_utc
+    now_utc = now_utc or _dt.now(_tz.utc)
+    points = portfolio_total_chart.build_chart(get_portfolio_total_chart_rows(days=3), [])["points"]
+    lines = ["<b>Portfolio Value</b>"]
+    if not points:
+        lines.append("No complete portfolio total in the last 3 days.")
+        return "\n".join(lines)
+    latest = points[-1]
+    t_latest = parse_utc(latest["t"])
+    lines.append("Total: " + html_escape(_telegram_money(latest["total"])) + " (as of "
+                 + html_escape(_telegram_pacific_clock(t_latest)) + ")")
+    age_h = (now_utc - t_latest).total_seconds() / 3600
+    if age_h > 6:
+        lines.append("Note: the latest complete run is {:.0f} hours old.".format(age_h))
+    target = t_latest - _td(hours=24)
+    cands = [p for p in points[:-1] if _td(hours=20) <= t_latest - parse_utc(p["t"]) <= _td(hours=28)]
+    if not cands:
+        lines.append("24h: no complete run 20 to 28 hours earlier.")
+    else:
+        then = min(cands, key=lambda p: abs((parse_utc(p["t"]) - target).total_seconds()))
+        if then["v"] != latest["v"]:
+            lines.append("24h: not comparable (the total's definition changed).")
+        else:
+            d = latest["total"] - then["total"]
+            pct = (" ({:+.1f}%)".format(d / then["total"] * 100)) if then["total"] else ""
+            lines.append("24h: " + html_escape(_telegram_signed_money(d)) + pct)
+    return "\n".join(lines)
+
+
+def _telegram_risk_gate_text():
+    """Risk Gate: counted perp trades toward the target and the gate's four checks (_perp_risk_gate)."""
+    from src.storage.portfolio_db import get_connection
+    from src.engines.telegram_service import html_escape
+    conn = get_connection()
+    try:
+        g = _perp_risk_gate(conn)
+    finally:
+        conn.close()
+    ck = g.get("checks") or {}
+    mark = lambda ok: "\u2705" if ok else "\u274c"
+    r = lambda v: "n/a" if v is None else "{:+.2f}R".format(float(v))
+    lines = ["<b>Risk Gate</b>",
+             "Status: " + ("Unlocked" if g.get("unlocked") else "Locked"),
+             mark(ck.get("count")) + " Counted trades: {} of {}".format(g.get("eligible_count"), g.get("target")),
+             mark(ck.get("average")) + " Average: " + r(g.get("expectancy_r"))
+             + " (needs above {:+.2f}R)".format(float(g.get("min_avg_r") or 0)),
+             mark(ck.get("recent")) + " Last {}: ".format(g.get("recent_n")) + r(g.get("recent_expectancy_r"))
+             + " (needs above 0R)",
+             mark(ck.get("reviews")) + " Trades awaiting review: {}".format(g.get("pending_reviews"))]
+    if g.get("count_from"):
+        lines.append("Counting trades opened since " + html_escape(g["count_from"]) + ".")
+    return "\n".join(lines)
 
 
 @app.route('/api/settings/telegram/test', methods=['POST'])
 def api_telegram_test():
-    """Send a test message with real content via Telegram."""
-    data = request.json or {}
-    chat_id = data.get("chat_id", "").strip()
-    # Always read the real token from disk — the form only has the masked version
+    """Send one message type now, marked as a test, with the SAVED token and chat ID. Body: {"type"}.
+    200 {"status", "message"}; 400 {"error"} (no type, not configured, or Telegram's error, any token
+    masked); 500 {"error"} when building the message fails."""
+    from src.engines.telegram_service import MESSAGE_TYPE_KEYS, send_message_type
+    from log_redact import redact
+    data = request.get_json(silent=True) or {}
+    kind = data.get("type") if isinstance(data, dict) else None
+    if kind not in MESSAGE_TYPE_KEYS:
+        return jsonify({"error": "Choose a message type to test."}), 400
     config = load_telegram_config()
-    bot_token = config.get("bot_token", "")
-    # Allow chat_id override from form, fall back to saved config
-    if not chat_id:
-        chat_id = config.get("chat_id", "")
-    if not bot_token:
-        return jsonify({"error": "No bot token configured — save your config first"}), 400
-    if not chat_id:
-        return jsonify({"error": "No chat ID configured"}), 400
     try:
-        messages = build_notification_content(config)
-        if not messages:
-            messages = ["DeFi Portfolio Dashboard — test notification OK\n\n(No digest or regime data available yet)"]
-        for msg in messages:
-            send_telegram_message(bot_token, chat_id, msg, timeout=10)
-        return jsonify({"status": "success", "message": f"Test sent ({len(messages)} message(s))"})
-    except RuntimeError as e:
-        return jsonify({"error": str(e)}), 400
+        n = send_message_type(config, kind, _telegram_build_message, timeout=10, test=True)
+    except (ValueError, RuntimeError) as e:
+        return jsonify({"error": redact(str(e))}), 400
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({"error": "Couldn't build the message: " + redact(str(e))}), 500
+    return jsonify({"status": "success", "message": f"Test sent ({n} message(s))"})
 
 
 # Triage-digest Telegram settings (file-KV; distinct from the daily-notification
@@ -12540,6 +12646,17 @@ def start_snapshot_scheduler():
     _scheduler_started = True
     from src.engines.snapshot_service import start_scheduler
     start_scheduler(_get_portfolio_data_for_snapshot, get_wallet_addresses, compose_total_fn=_compose_total_for_snapshot)
+    _spawn_telegram_messages_thread()
+
+
+def _spawn_telegram_messages_thread():
+    """Landing 94: the Messaging settings' scheduler (telegram_service.messages_loop), one daemon thread,
+    started once with the snapshot scheduler. The app passes its own message builder, so the loop never
+    imports web_portfolio (run as a script, that import would load a second copy with its own scheduler).
+    Tests replace this with a no-op (conftest)."""
+    from src.engines.telegram_service import messages_loop
+    threading.Thread(target=messages_loop, args=(_telegram_build_message,), daemon=True,
+                     name='telegram-messages').start()
 
 
 @app.route('/api/snapshot', methods=['POST'])

@@ -1430,138 +1430,115 @@ function BackupSection() {
 }
 
 // ── 8. Messaging ───────────────────────────────────────────────────────────
+// Landing 94 (Nov 4): one row per message type (the server's "types" list), each with a checkbox, a send
+// time in Pacific time and its own Send test button. Errors show the server's own text.
+function msgErrorText(e, fallback) {
+  try {
+    const j = JSON.parse(e && e.message);
+    if (j && typeof j.error === 'string' && j.error) return j.error;
+  } catch (x) { /* not JSON */ }
+  return fallback;
+}
+
 function MessagingSection() {
-  const [cfg, setCfg] = useSState({ bot_token: '', chat_id: '', utc_hour: 8, enabled: false, content: { daily_digest: true, market_regime: true } });
-  const [loading, setLoading] = useSState(true);
+  const [cfg, setCfg] = useSState(null);
+  const [loadError, setLoadError] = useSState('');
   const [saving, setSaving] = useSState(false);
-  const [testing, setTesting] = useSState(false);
-  const [saveStatus, setSaveStatus] = useSState('');
-  const [testResult, setTestResult] = useSState('');
-  const [testOk, setTestOk] = useSState(false);
+  const [saveStatus, setSaveStatus] = useSState({ text: '', ok: false });
+  const [dirty, setDirty] = useSState(false);
+  const [tests, setTests] = useSState({});   // type -> { busy, text, ok }
 
   useSEffect(() => {
     api('/api/settings/telegram')
-      .then(d => setCfg(prev => ({ ...prev, ...d })))
-      .catch(() => {})
-      .finally(() => setLoading(false));
+      .then(d => setCfg(d))
+      .catch(e => setLoadError(msgErrorText(e, "Couldn't load the Messaging settings.")));
   }, []);
 
-  function setField(k, v) { setCfg(c => ({ ...c, [k]: v })); }
-  function setContent(k, v) { setCfg(c => ({ ...c, content: { ...(c.content || {}), [k]: v } })); }
+  function setField(k, v) { setCfg(c => ({ ...c, [k]: v })); setDirty(true); }
+  function setMsg(type, k, v) {
+    setCfg(c => ({ ...c, messages: { ...c.messages, [type]: { ...c.messages[type], [k]: v } } }));
+    setDirty(true);
+  }
 
   async function save() {
-    setSaving(true); setSaveStatus('');
+    setSaving(true); setSaveStatus({ text: '', ok: false });
     try {
-      await api('/api/settings/telegram', { method: 'POST', body: JSON.stringify(cfg) });
-      setSaveStatus('Saved ✓');
-    } catch (e) { setSaveStatus('Error saving'); }
-    finally { setSaving(false); setTimeout(() => setSaveStatus(''), 2000); }
+      const d = await api('/api/settings/telegram', { method: 'POST', body: JSON.stringify({
+        bot_token: cfg.bot_token, chat_id: cfg.chat_id, enabled: !!cfg.enabled, messages: cfg.messages }) });
+      setCfg(d); setDirty(false);
+      setSaveStatus({ text: 'Saved', ok: true });
+    } catch (e) {
+      setSaveStatus({ text: msgErrorText(e, "Couldn't save. Check the connection and try again."), ok: false });
+    } finally { setSaving(false); }
   }
 
-  async function sendTest() {
-    setTesting(true); setTestResult(''); setTestOk(false);
+  async function sendTest(type) {
+    setTests(t => ({ ...t, [type]: { busy: true, text: '', ok: false } }));
     try {
-      await api('/api/settings/telegram/test', { method: 'POST' });
-      setTestResult('Test message sent'); setTestOk(true);
-    } catch (e) { setTestResult('Failed to send'); setTestOk(false); }
-    finally { setTesting(false); }
+      const d = await api('/api/settings/telegram/test', { method: 'POST', body: JSON.stringify({ type }) });
+      setTests(t => ({ ...t, [type]: { busy: false, text: (d && d.message) || 'Test sent', ok: true } }));
+    } catch (e) {
+      setTests(t => ({ ...t, [type]: { busy: false, text: msgErrorText(e, "Couldn't send. Check the connection and try again."), ok: false } }));
+    }
   }
 
-  if (loading) return React.createElement('span', { style: { color: 'var(--text4)', fontSize: 13 } }, 'Loading…');
+  if (loadError) return React.createElement('div', { className: 'tv-card', style: { padding: 24, fontSize: 13, color: 'var(--fail)' } }, loadError);
+  if (!cfg) return React.createElement('span', { style: { color: 'var(--text2)', fontSize: 13 } }, 'Loading\u2026');
 
-  const content = cfg.content || {};
+  const types = cfg.types || [];
+  const label = t => React.createElement('div', { className: 'tv-label', style: { marginBottom: 6 } }, t);
 
-  return React.createElement('div', { className: 'tv-card', style: { padding: 24 } },
+  return React.createElement('div', { className: 'tv-card msg-card', style: { padding: 24 } },
 
-    // Header
-    React.createElement('div', { style: { fontSize: 16, fontWeight: 700, color: 'var(--accent)', marginBottom: 6 } }, '📨  Telegram Notifications'),
-    React.createElement('div', { style: { fontSize: 13, color: 'var(--text4)', marginBottom: 22, lineHeight: 1.55, maxWidth: 640 } },
-      'Receive daily portfolio digests and market regime assessments via Telegram. Create a bot with @BotFather to get your bot token.'
+    React.createElement('div', { style: { fontSize: 16, fontWeight: 700, color: 'var(--accent)', marginBottom: 6 } }, 'Telegram Messages'),
+    React.createElement('div', { style: { fontSize: 13, color: 'var(--text2)', marginBottom: 22, lineHeight: 1.55, maxWidth: 680 } },
+      'Each message type goes out once a day at its own time (Pacific time). Create a bot with @BotFather for the token; send the bot a message, then read your chat ID from getUpdates.'
     ),
 
-    // Four-column input row
-    React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 24 } },
-
-      // Col 1: Bot Token
-      React.createElement('div', null,
-        React.createElement('div', { className: 'tv-label', style: { marginBottom: 6 } }, 'BOT TOKEN'),
-        React.createElement('input', {
-          type: 'password',
-          value: cfg.bot_token || '',
-          onChange: e => setField('bot_token', e.target.value),
-          className: 'tv-input',
-          placeholder: 'Paste value',
-          style: { width: '100%' },
-        })
-      ),
-
-      // Col 2: Chat ID
-      React.createElement('div', null,
-        React.createElement('div', { className: 'tv-label', style: { marginBottom: 6 } }, 'CHAT ID'),
-        React.createElement('input', {
-          type: 'text',
-          value: cfg.chat_id || '',
-          onChange: e => setField('chat_id', e.target.value),
-          className: 'tv-input',
-          placeholder: 'Paste value',
-          style: { width: '100%' },
-        })
-      ),
-
-      // Col 3: Schedule UTC Hour
-      React.createElement('div', null,
-        React.createElement('div', { className: 'tv-label', style: { marginBottom: 6 } }, 'SCHEDULE (UTC HOUR)'),
-        React.createElement('input', {
-          type: 'number',
-          min: 0, max: 23,
-          value: cfg.utc_hour != null ? cfg.utc_hour : 8,
-          onChange: e => setField('utc_hour', Number(e.target.value)),
-          className: 'tv-input',
-          style: { width: '100%' },
-        })
-      ),
-
-      // Col 4: Enabled dropdown
-      React.createElement('div', null,
-        React.createElement('div', { className: 'tv-label', style: { marginBottom: 6 } }, 'ENABLED'),
-        React.createElement('select', {
-          value: cfg.enabled ? 'enabled' : 'disabled',
-          onChange: e => setField('enabled', e.target.value === 'enabled'),
-          className: 'tv-input',
-          style: { width: '100%' },
-        },
-          React.createElement('option', { value: 'enabled' }, 'Enabled'),
-          React.createElement('option', { value: 'disabled' }, 'Disabled')
-        )
-      )
+    React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 16, marginBottom: 24 } },
+      React.createElement('div', null, label('BOT TOKEN'),
+        React.createElement('input', { type: 'password', value: cfg.bot_token || '', 'aria-label': 'Bot token',
+          onChange: e => setField('bot_token', e.target.value), className: 'tv-input', placeholder: 'Paste value', style: { width: '100%' } })),
+      React.createElement('div', null, label('CHAT ID'),
+        React.createElement('input', { type: 'text', value: cfg.chat_id || '', 'aria-label': 'Chat ID',
+          onChange: e => setField('chat_id', e.target.value), className: 'tv-input', placeholder: 'Paste value', style: { width: '100%' } })),
+      React.createElement('div', null, label('ALL MESSAGES'),
+        React.createElement('select', { value: cfg.enabled ? 'enabled' : 'disabled', 'aria-label': 'All messages',
+          onChange: e => setField('enabled', e.target.value === 'enabled'), className: 'tv-input', style: { width: '100%' } },
+          React.createElement('option', { value: 'enabled' }, 'On'),
+          React.createElement('option', { value: 'disabled' }, 'Off (nothing is sent)')))
     ),
 
-    // Notification Content
-    React.createElement('div', { style: { fontSize: 13, fontWeight: 600, color: 'var(--accent)', marginBottom: 12 } }, 'Notification Content'),
-    React.createElement('div', { style: { display: 'flex', gap: 28, marginBottom: 24 } },
-      [['daily_digest', '✓ Daily Digest'], ['market_regime', '✓ Market Regime Assessment']].map(([k, lbl]) =>
-        React.createElement('label', { key: k, style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--text2)', cursor: 'pointer' } },
-          React.createElement('input', {
-            type: 'checkbox',
-            checked: !!content[k],
-            onChange: e => setContent(k, e.target.checked),
-            style: { accentColor: 'var(--accent)', width: 15, height: 15 },
-          }),
-          lbl
-        )
-      )
+    React.createElement('div', { style: { fontSize: 13, fontWeight: 600, color: 'var(--accent)', marginBottom: 10 } }, 'Messages (times in Pacific time)'),
+    React.createElement('div', { className: 'msg-rows', style: { marginBottom: 20 } },
+      types.map(t => {
+        const m = (cfg.messages || {})[t.key] || { enabled: false, time: '07:00' };
+        const st = tests[t.key] || {};
+        return React.createElement('div', { key: t.key, className: 'msg-row', 'data-type': t.key,
+          style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 14, padding: '12px 0', borderTop: '2px solid rgba(255,255,255,0.25)' } },
+          React.createElement('label', { style: { display: 'flex', alignItems: 'flex-start', gap: 8, flex: '1 1 260px', cursor: 'pointer' } },
+            React.createElement('input', { type: 'checkbox', checked: !!m.enabled, onChange: e => setMsg(t.key, 'enabled', e.target.checked),
+              style: { accentColor: 'var(--accent)', width: 16, height: 16, marginTop: 2 } }),
+            React.createElement('span', null,
+              React.createElement('span', { style: { fontSize: 14, fontWeight: 600, color: 'var(--text)' } }, t.label),
+              React.createElement('span', { style: { display: 'block', fontSize: 13, color: 'var(--text2)', marginTop: 2 } }, t.description))),
+          React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--text2)' } },
+            React.createElement('input', { type: 'time', step: 60, value: m.time, required: true, className: 'tv-input',
+              'aria-label': t.label + ' send time (Pacific)',
+              onChange: e => { if (e.target.value) setMsg(t.key, 'time', e.target.value.slice(0, 5)); }, style: { width: 130 } }),
+            'Pacific'),
+          React.createElement('button', { type: 'button', className: 'tv-btn', style: { fontSize: 13, padding: '6px 14px' },
+            disabled: !!st.busy, onClick: () => sendTest(t.key) }, st.busy ? 'Sending\u2026' : 'Send test'),
+          st.text && React.createElement('span', { role: 'status', style: { fontSize: 13, color: st.ok ? 'var(--ok)' : 'var(--fail)', flexBasis: '100%' } }, st.text)
+        );
+      })
     ),
 
-    // Button row
     React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' } },
-      React.createElement('button', { className: 'tv-btn', style: { fontSize: 13, padding: '6px 20px' }, onClick: save, disabled: saving },
-        saving ? 'Saving…' : 'Save'
-      ),
-      React.createElement('button', { className: 'tv-btn primary', style: { fontSize: 13, padding: '6px 20px' }, onClick: sendTest, disabled: testing },
-        testing ? 'Sending…' : 'Send Test Message'
-      ),
-      saveStatus && React.createElement('span', { style: { fontSize: 12, color: saveStatus.includes('✓') ? 'var(--ok)' : 'var(--fail)' } }, saveStatus),
-      testResult && React.createElement('span', { style: { fontSize: 12, color: testOk ? 'var(--ok)' : 'var(--fail)' } }, testResult)
+      React.createElement('button', { type: 'button', className: 'tv-btn primary', style: { fontSize: 13, padding: '6px 20px' }, onClick: save, disabled: saving },
+        saving ? 'Saving\u2026' : 'Save'),
+      dirty && !saving && React.createElement('span', { style: { fontSize: 13, color: 'var(--text2)' } }, 'Unsaved changes. Send test uses the saved token and chat ID.'),
+      saveStatus.text && React.createElement('span', { role: 'status', style: { fontSize: 13, color: saveStatus.ok ? 'var(--ok)' : 'var(--fail)' } }, saveStatus.text)
     )
   );
 }
