@@ -1610,6 +1610,30 @@ def init_db():
         )
     """)
 
+    # Links to a trade's journal posts (Landing 96; Glenn's Nov 9 rulings):
+    # a Discord message link (kind 'discord') or any other https link (kind
+    # 'link'), with an optional phase (entry / management / exit) and a short
+    # caption. Keyed by the opaque trade_id the trades route emits. Links only:
+    # nothing is downloaded or stored besides the URL. No CHECK on kind or
+    # phase: the route checks them, so a label can change without a table
+    # rebuild. Rows are never deleted: removing a link sets removed_at. Read by
+    # the trade-links routes only; nothing that counts money, R, the gate or a
+    # message reads this table.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS trade_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_id TEXT NOT NULL,
+            url TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            phase TEXT,
+            caption TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            removed_at TEXT
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_trade_links_trade ON trade_links (trade_id, removed_at)")
+
     # Spot plan per spot trade (Landing 59; Glenn's Oct 23 rulings, "A, A, A"):
     # basis (own_setup / analyst_call / other), the setup for an own chart
     # setup, a one-line thesis (required for an analyst call), the exit plan,

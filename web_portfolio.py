@@ -8453,6 +8453,239 @@ def api_trading_trade_annotation(trade_id):
         return jsonify({'error': str(e)}), 500
 
 
+# -- Trade links (Landing 96; Glenn's Nov 9 rulings, "your recs") -------------
+# Links from a trade to Glenn's trading-journal posts, kept in trade_links. A
+# Discord message link (kind 'discord') or any other https link (kind 'link'),
+# with an optional phase and a short caption. Links only: nothing is fetched,
+# downloaded or stored besides the URL, and Discord attachment links (the CDN
+# hosts) are refused so a link always points at the post, not at a file that
+# expires. Read by these routes only: the rule check, the gate, R, the trades
+# payload, Telegram messages and the advisor never read the table.
+TRADE_LINKS_MAX = 10                  # active links per trade
+TRADE_LINK_URL_MAX = 500
+TRADE_LINK_CAPTION_MAX = 200
+TRADE_LINK_PHASES = ("entry", "management", "exit")
+TRADE_LINK_DISCORD_HOSTS = ("discord.com", "ptb.discord.com", "canary.discord.com", "discordapp.com")
+TRADE_LINK_DISCORD_CDN_HOSTS = ("cdn.discordapp.com", "media.discordapp.net")
+_TRADE_LINK_DISCORD_CDN_RE = re.compile(r"images-ext-[^.]+\.discordapp\.net")
+_TRADE_LINK_DISCORD_MESSAGE_RE = re.compile(r"/channels/(?:\d+|@me)/\d+/\d+")
+TRADE_LINK_ATTACHMENT_HINT = ("That is a Discord attachment link, which expires. Copy the message link instead: "
+                              "right-click the message (or long-press it) and choose Copy Message Link.")
+
+
+def _trade_link_url(raw):
+    """Check one link URL. Returns (url, kind, None) or (None, None, error).
+    https only, 1 to TRADE_LINK_URL_MAX characters, no whitespace or control
+    characters, a host and no user name or password in it. The host is
+    lowercased; the rest is kept as given. Discord attachment hosts are refused
+    with TRADE_LINK_ATTACHMENT_HINT. kind is 'discord' for a message link on a
+    Discord host, else 'link'."""
+    from urllib.parse import urlsplit
+    if not isinstance(raw, str):
+        return None, None, "url must be a string"
+    url = raw.strip()
+    if not url:
+        return None, None, "url is required"
+    if len(url) > TRADE_LINK_URL_MAX:
+        return None, None, f"url must be at most {TRADE_LINK_URL_MAX} characters"
+    if any(ch.isspace() or ord(ch) < 32 or 127 <= ord(ch) < 160 for ch in url):
+        return None, None, "url must not contain spaces or control characters"
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return None, None, "url is not a valid link"
+    if parts.scheme.lower() != "https":
+        return None, None, "url must start with https://"
+    if not url[len(parts.scheme):].startswith("://") or not parts.hostname:
+        return None, None, "url must include a host"
+    if parts.username is not None or parts.password is not None:
+        return None, None, "url must not include a user name or password"
+    host = parts.hostname.lower()
+    if host in TRADE_LINK_DISCORD_CDN_HOSTS or _TRADE_LINK_DISCORD_CDN_RE.fullmatch(host):
+        return None, None, TRADE_LINK_ATTACHMENT_HINT
+    netloc = host if port is None else f"{host}:{port}"
+    if ":" in host:                   # an IPv6 literal keeps its brackets
+        netloc = f"[{host}]" if port is None else f"[{host}]:{port}"
+    start = len(parts.scheme) + 3
+    url = url[:start] + netloc + url[start + len(parts.netloc):]
+    kind = "discord" if host in TRADE_LINK_DISCORD_HOSTS and _TRADE_LINK_DISCORD_MESSAGE_RE.fullmatch(parts.path) \
+        else "link"
+    return url, kind, None
+
+
+def _trade_link_phase(raw):
+    """(phase, None) or (None, error): null, or one of TRADE_LINK_PHASES."""
+    if raw is None:
+        return None, None
+    if not isinstance(raw, str) or raw not in TRADE_LINK_PHASES:
+        return None, "phase must be null or one of: " + ", ".join(TRADE_LINK_PHASES)
+    return raw, None
+
+
+def _trade_link_caption(raw):
+    """(caption, None) or (None, error): null, or a string of up to
+    TRADE_LINK_CAPTION_MAX characters once trimmed; a blank caption is null."""
+    if raw is None:
+        return None, None
+    if not isinstance(raw, str):
+        return None, f"caption must be a string of up to {TRADE_LINK_CAPTION_MAX} characters, or null"
+    text = raw.strip()
+    if len(text) > TRADE_LINK_CAPTION_MAX:
+        return None, f"caption must be a string of up to {TRADE_LINK_CAPTION_MAX} characters, or null"
+    return (text or None), None
+
+
+def _trade_link_view(row):
+    return {"id": row["id"], "url": row["url"], "kind": row["kind"], "phase": row["phase"],
+            "caption": row["caption"], "created_at": row["created_at"], "updated_at": row["updated_at"]}
+
+
+def _trade_link_known(conn, trade_id):
+    """The annotation route's known-trade check: a trade_id GET
+    /api/trading/trades emits (spot, Hyperliquid, TxFlow or manual)."""
+    trades, _annotations = _trades_build(conn)
+    return any(t["trade_id"] == trade_id for t in trades)
+
+
+def _trade_link_active(conn, trade_id, link_id):
+    return conn.execute("SELECT * FROM trade_links WHERE id = ? AND trade_id = ? AND removed_at IS NULL",
+                        (link_id, trade_id)).fetchone()
+
+
+@app.route('/api/trading/trades/<trade_id>/links', methods=['GET', 'POST'])
+def api_trading_trade_links(trade_id):
+    """GET: {"links": [...]}, the trade's active links, oldest first.
+    POST {url, phase?, caption?}: adds a link (201). The same active URL on
+    the trade answers 200 with the stored link (phase and caption ignored); a
+    trade with TRADE_LINKS_MAX active links is a 409. An unknown trade is a 404,
+    as for the annotation route; manual trades take links too."""
+    try:
+        from src.storage.portfolio_db import get_connection
+        if request.method == 'POST':
+            data = request.get_json(silent=True)
+            if not isinstance(data, dict):
+                return jsonify({"error": "send a JSON object with url"}), 400
+            url, kind, err = _trade_link_url(data.get("url"))
+            if err:
+                return jsonify({"error": err}), 400
+            phase, err = _trade_link_phase(data.get("phase"))
+            if err:
+                return jsonify({"error": err}), 400
+            caption, err = _trade_link_caption(data.get("caption"))
+            if err:
+                return jsonify({"error": err}), 400
+        conn = get_connection()
+        try:
+            if not _trade_link_known(conn, trade_id):
+                return jsonify({"error": "trade not found"}), 404
+            if request.method == 'GET':
+                rows = conn.execute("SELECT * FROM trade_links WHERE trade_id = ? AND removed_at IS NULL "
+                                    "ORDER BY created_at, id", (trade_id,)).fetchall()
+                return jsonify({"links": [_trade_link_view(r) for r in rows]})
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                same = conn.execute("SELECT * FROM trade_links WHERE trade_id = ? AND url = ? AND removed_at IS NULL "
+                                    "ORDER BY id LIMIT 1", (trade_id, url)).fetchone()
+                if same is not None:
+                    conn.rollback()
+                    return jsonify({"link": _trade_link_view(same)}), 200
+                n = conn.execute("SELECT COUNT(*) FROM trade_links WHERE trade_id = ? AND removed_at IS NULL",
+                                 (trade_id,)).fetchone()[0]
+                if n >= TRADE_LINKS_MAX:
+                    conn.rollback()
+                    return jsonify({"error": f"a trade holds at most {TRADE_LINKS_MAX} links; remove one first"}), 409
+                now = _note_now()
+                cur = conn.execute("INSERT INTO trade_links (trade_id, url, kind, phase, caption, created_at, updated_at) "
+                                   "VALUES (?, ?, ?, ?, ?, ?, ?)", (trade_id, url, kind, phase, caption, now, now))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            row = conn.execute("SELECT * FROM trade_links WHERE id = ?", (cur.lastrowid,)).fetchone()
+            return jsonify({"link": _trade_link_view(row)}), 201
+        finally:
+            conn.close()
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/trading/trades/<trade_id>/links/<int:link_id>', methods=['PUT', 'DELETE'])
+def api_trading_trade_link(trade_id, link_id):
+    """PUT {phase?, caption?}: changes an active link's phase and / or caption
+    (the URL cannot change: 400 if sent) and sets updated_at. DELETE sets
+    removed_at; the row is kept. A link that is not this trade's, or already
+    removed, is a 404; an unknown trade is a 404, as for the annotation route."""
+    try:
+        from src.storage.portfolio_db import get_connection
+        fields = {}
+        if request.method == 'PUT':
+            data = request.get_json(silent=True)
+            if not isinstance(data, dict):
+                return jsonify({"error": "send a JSON object with phase and / or caption"}), 400
+            if "url" in data:
+                return jsonify({"error": "a link's url cannot change; remove the link and add the new one"}), 400
+            if "phase" not in data and "caption" not in data:
+                return jsonify({"error": "Nothing to update"}), 400
+            if "phase" in data:
+                fields["phase"], err = _trade_link_phase(data["phase"])
+                if err:
+                    return jsonify({"error": err}), 400
+            if "caption" in data:
+                fields["caption"], err = _trade_link_caption(data["caption"])
+                if err:
+                    return jsonify({"error": err}), 400
+        conn = get_connection()
+        try:
+            if not _trade_link_known(conn, trade_id):
+                return jsonify({"error": "trade not found"}), 404
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if _trade_link_active(conn, trade_id, link_id) is None:
+                    conn.rollback()
+                    return jsonify({"error": "link not found"}), 404
+                now = _note_now()
+                if request.method == 'DELETE':
+                    conn.execute("UPDATE trade_links SET removed_at = ?, updated_at = ? WHERE id = ?",
+                                 (now, now, link_id))
+                else:
+                    fields["updated_at"] = now
+                    conn.execute(f"UPDATE trade_links SET {', '.join(f'{c} = ?' for c in fields)} WHERE id = ?",
+                                 tuple(fields.values()) + (link_id,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            if request.method == 'DELETE':
+                return jsonify({"removed": True, "id": link_id})
+            row = conn.execute("SELECT * FROM trade_links WHERE id = ?", (link_id,)).fetchone()
+            return jsonify({"link": _trade_link_view(row)})
+        finally:
+            conn.close()
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/trading/trade-links/counts', methods=['GET'])
+def api_trading_trade_link_counts():
+    """{"counts": {trade_id: n}}: active links per trade (trades with none are
+    left out). Its own route, so no existing payload changes."""
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            rows = conn.execute("SELECT trade_id, COUNT(*) AS n FROM trade_links WHERE removed_at IS NULL "
+                                "GROUP BY trade_id ORDER BY trade_id").fetchall()
+        finally:
+            conn.close()
+        return jsonify({"counts": {r["trade_id"]: r["n"] for r in rows}})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
 # ── Trade-open snapshot (Landing 4, HANDOFF_spot_perps_rebuild 3.5 and 14) ──
 # What each trade opened under, kept for reviewing entries against Glenn's
 # rules and for the future advisor:
