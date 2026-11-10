@@ -838,6 +838,241 @@ function PerpsNotesEditor({ trade, saver, withDeviation }) {
   </div>;
 }
 
+/* -- journal links (Landing 97) -------------------------------------------- */
+
+// Landing 96 / 97 (Glenn, Nov 9 "your recs"): links from a trade to its posts in
+// Glenn's Discord trading journal, kept by the server in trade_links. Links
+// only: nothing is fetched or stored but the URL. Discord attachment links are
+// refused (the server too); a link has an optional phase and a short caption.
+// Links show no balances, so Hide values leaves them visible.
+const PRP_LINKS_MAX = 10;               // TRADE_LINKS_MAX on the server
+const PRP_LINK_CAPTION_MAX = 200;       // TRADE_LINK_CAPTION_MAX
+const PRP_LINK_URL_MAX = 500;           // TRADE_LINK_URL_MAX
+const PRP_LINK_SHORT = 60;              // a link with no caption shows its URL cut to this length
+const PRP_LINK_PHASES = [['entry', 'Entry'], ['management', 'Management'], ['exit', 'Exit']];
+const PRP_LINK_PHASE_WORD = { entry: 'Entry', management: 'Management', exit: 'Exit' };
+const PRP_LINK_LIMIT_TEXT = PRP_LINKS_MAX + ' links is the most a trade can hold; remove one first.';
+const PRP_LINK_ATTACHMENT_HINT = 'That is a Discord attachment link, which expires. Copy the message link instead: '
+  + 'right-click the message (or long-press it) and choose Copy Message Link.';   // the server's own text
+const PRP_LINK_CHIP = { fontSize: 12, lineHeight: '16px', padding: '1px 8px', flex: 'none' };
+
+function prpLinksPath(tradeId, linkId) {
+  return '/api/trading/trades/' + encodeURIComponent(tradeId) + '/links' + (linkId == null ? '' : '/' + linkId);
+}
+
+// A hint only: the server decides. True for a Discord attachment (CDN) link.
+function prpLinkIsAttachment(raw) {
+  let host = '';
+  try { host = new URL(String(raw || '').trim()).hostname.toLowerCase(); } catch (_e) { return false; }
+  return host === 'cdn.discordapp.com' || host === 'media.discordapp.net' || /^images-ext-[^.]+\.discordapp\.net$/.test(host);
+}
+
+// The URL cut in the middle to about PRP_LINK_SHORT characters.
+function prpLinkShort(url) {
+  const s = String(url || '');
+  if (s.length <= PRP_LINK_SHORT) return s;
+  const keep = PRP_LINK_SHORT - 3;
+  const head = Math.ceil(keep * 0.6);
+  return s.slice(0, head) + '...' + s.slice(s.length - (keep - head));
+}
+
+function PerpsLinkChip({ kind, children }) {
+  const look = kind === 'discord' ? { cls: 'tv-chip adapt' }
+    : kind === 'phase' ? { cls: 'tv-chip accent' }
+    : { cls: 'tv-chip', style: { color: 'var(--text2)', borderColor: 'var(--text4)', background: 'var(--panel3)' } };
+  return <span className={look.cls} style={{ ...PRP_LINK_CHIP, ...(look.style || {}) }}>{children}</span>;
+}
+
+// The symbol line's journal-link count (shown only above 0).
+function PerpsLinkCount({ n }) {
+  if (!(n > 0)) return null;
+  const words = n + (n === 1 ? ' journal link' : ' journal links');
+  return <span title={words} aria-label={words} style={{ marginLeft: 6, color: 'var(--text3)', fontWeight: 400, fontSize: 12, whiteSpace: 'nowrap' }}>
+    {'\uD83D\uDD17 ' + n}</span>;
+}
+
+function PerpsLinkPhaseSelect({ value, onChange, disabled, label, onKeyDown }) {
+  return <select className="tv-select" aria-label={label} value={value} disabled={disabled}
+    onChange={e => onChange(e.target.value)} onKeyDown={onKeyDown} style={{ fontSize: 13, minHeight: 32 }}>
+    <option value="">No phase</option>
+    {PRP_LINK_PHASES.map(([v, w]) => <option key={v} value={v}>{w}</option>)}
+  </select>;
+}
+
+// The links of one trade, inside its Notes card: list, edit, remove, add. One
+// request at a time; after every add or remove onCountChange(trade_id, n) gets
+// the trade's new count of active links.
+function PerpsJournalLinks({ trade, onCountChange }) {
+  const tradeId = trade.trade_id;
+  const [links, setLinks] = usePRPState(null);
+  const [loadError, setLoadError] = usePRPState(null);
+  const [saving, setSaving] = usePRPState(false);
+  const [status, setStatus] = usePRPState(null);
+  const [note, setNote] = usePRPState(null);
+  const [url, setUrl] = usePRPState('');
+  const [phase, setPhase] = usePRPState('');
+  const [caption, setCaption] = usePRPState('');
+  const [editing, setEditing] = usePRPState(null);       // { id, phase, caption }
+  const [confirming, setConfirming] = usePRPState(null);  // the id asked about
+  const aliveRef = usePRPRef(true);
+  const reqRef = usePRPRef(0);
+  const busyRef = usePRPRef(false);
+  const timerRef = usePRPRef(null);
+  usePRPEffect(() => () => { aliveRef.current = false; reqRef.current += 1; clearTimeout(timerRef.current); }, []);
+
+  function load() {
+    const mine = ++reqRef.current;
+    setLoadError(null);
+    api(prpLinksPath(tradeId)).then(d => {
+      if (!aliveRef.current || mine !== reqRef.current) return;
+      if (!d || !Array.isArray(d.links)) throw new Error('Unexpected response');
+      setLinks(d.links);
+    }).catch(e => {
+      if (!aliveRef.current || mine !== reqRef.current) return;
+      setLoadError(prpErr(e));
+    });
+  }
+  usePRPEffect(() => { load(); }, [tradeId]);
+
+  // One write at a time. apply(reply) runs on success; the reply's error stays on failure.
+  function send(path, options, apply) {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    reqRef.current += 1;              // a read still on its way is older than this write
+    setSaving(true);
+    setStatus(null);
+    setNote(null);
+    clearTimeout(timerRef.current);
+    api(path, options).then(d => {
+      busyRef.current = false;
+      if (!aliveRef.current) return;
+      setSaving(false);
+      setStatus('saved');
+      timerRef.current = setTimeout(() => { if (aliveRef.current) setStatus(null); }, PRP_SAVED_MS);
+      apply(d);
+    }).catch(e => {
+      busyRef.current = false;
+      if (aliveRef.current) { setSaving(false); setStatus({ error: prpErr(e) }); }
+    });
+  }
+
+  const list = links || [];
+  const full = list.length >= PRP_LINKS_MAX;
+  const canAdd = !!links && url.trim() !== '' && !saving && !full;
+
+  function add() {
+    if (!canAdd) return;
+    if (prpLinkIsAttachment(url)) { setNote(null); setStatus({ error: PRP_LINK_ATTACHMENT_HINT }); return; }
+    const body = { url: url.trim(), phase: phase || null, caption: caption.trim() === '' ? null : caption };
+    send(prpLinksPath(tradeId), { method: 'POST', body: JSON.stringify(body) }, d => {
+      const link = d && d.link;
+      if (!link) return;
+      const already = list.some(l => l.id === link.id);
+      const next = already ? list : list.concat([link]);
+      setLinks(next);
+      setUrl(''); setPhase(''); setCaption('');
+      if (already) { setStatus(null); setNote('Already attached.'); }
+      if (onCountChange) onCountChange(tradeId, next.length);
+    });
+  }
+
+  function saveEdit() {
+    if (!editing || saving) return;
+    const body = { phase: editing.phase || null, caption: editing.caption.trim() === '' ? null : editing.caption };
+    send(prpLinksPath(tradeId, editing.id), { method: 'PUT', body: JSON.stringify(body) }, d => {
+      const link = d && d.link;
+      if (link) setLinks(list.map(l => l.id === link.id ? link : l));
+      setEditing(null);
+    });
+  }
+
+  function remove(id) {
+    if (saving) return;
+    send(prpLinksPath(tradeId, id), { method: 'DELETE' }, () => {
+      const next = list.filter(l => l.id !== id);
+      setLinks(next);
+      setConfirming(null);
+      if (onCountChange) onCountChange(tradeId, next.length);
+    });
+  }
+
+  const editKeys = e => {
+    if (e.key === 'Enter') { e.preventDefault(); saveEdit(); }
+    else if (e.key === 'Escape') { e.preventDefault(); setEditing(null); }
+  };
+  const idUrl = 'prp-link-url-' + tradeId;
+
+  return <div data-prp-links={tradeId} style={{ display: 'flex', flexDirection: 'column', gap: 8, borderTop: PRP_LINE, paddingTop: 12, minWidth: 0 }}>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+      <span style={PRP_SECTION}>Journal links</span>
+      <span style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--text3)', fontFamily: PRP_MONO }}>{list.length} / {PRP_LINKS_MAX}</span>
+    </div>
+    {!links && !loadError && <span role="status" style={{ fontSize: 13, color: 'var(--text3)' }}>Loading links...</span>}
+    {loadError && <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+      <span role="alert" style={{ fontSize: 13, color: 'var(--fail)', overflowWrap: 'anywhere' }}>{"Couldn't load links: " + loadError}</span>
+      <button type="button" className="tv-btn" style={PRP_SMALL_BTN} onClick={load}>Retry</button>
+    </div>}
+    {links && list.length === 0 && <span style={{ fontSize: 13, color: 'var(--text3)' }}>No journal links yet.</span>}
+    {list.map(l => {
+      const isEditing = editing && editing.id === l.id;
+      const isAsking = confirming === l.id;
+      return <div key={l.id} data-prp-link={l.id} style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', minWidth: 0,
+                                                            padding: '6px 0', borderBottom: '1px solid var(--line)' }}>
+        <PerpsLinkChip kind={l.kind === 'discord' ? 'discord' : 'link'}>{l.kind === 'discord' ? 'Discord' : 'Link'}</PerpsLinkChip>
+        {!isEditing && l.phase && <PerpsLinkChip kind="phase">{PRP_LINK_PHASE_WORD[l.phase] || l.phase}</PerpsLinkChip>}
+        {isEditing
+          ? <React.Fragment>
+              <PerpsLinkPhaseSelect label="Phase" value={editing.phase} disabled={saving} onKeyDown={editKeys}
+                onChange={v => setEditing(x => Object.assign({}, x, { phase: v }))} />
+              <input className="tv-input" aria-label="Caption" maxLength={PRP_LINK_CAPTION_MAX} placeholder="Caption (optional)"
+                style={{ flex: '1 1 180px', minWidth: 0, fontSize: 13 }} value={editing.caption} disabled={saving} autoFocus
+                onChange={e => { const v = e.target.value; setEditing(x => Object.assign({}, x, { caption: v })); }} onKeyDown={editKeys} />
+              <button type="button" className="tv-btn primary" style={prpBtn(saving, PRP_SMALL_BTN)} disabled={saving} onClick={saveEdit}>Save</button>
+              <button type="button" className="tv-btn" style={prpBtn(saving, PRP_SMALL_BTN)} disabled={saving} onClick={() => setEditing(null)}>Cancel</button>
+            </React.Fragment>
+          : <React.Fragment>
+              <a href={l.url} target="_blank" rel="noopener noreferrer" title={l.url}
+                style={{ flex: '1 1 160px', minWidth: 0, fontSize: 13, color: 'var(--text)', textDecoration: 'underline', overflowWrap: 'anywhere' }}>
+                {l.caption ? l.caption : prpLinkShort(l.url)}</a>
+              {isAsking
+                ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <span style={{ fontSize: 13, color: 'var(--text2)' }}>Remove this link?</span>
+                    <button type="button" className="tv-btn danger" style={prpBtn(saving, PRP_SMALL_BTN)} disabled={saving} onClick={() => remove(l.id)}>Remove</button>
+                    <button type="button" className="tv-btn" style={prpBtn(saving, PRP_SMALL_BTN)} disabled={saving} onClick={() => setConfirming(null)}>Keep</button>
+                  </span>
+                : <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                    <button type="button" className="tv-btn" style={prpBtn(saving, PRP_SMALL_BTN)} disabled={saving}
+                      aria-label={'Edit the link ' + (l.caption || l.url)}
+                      onClick={() => { setConfirming(null); setEditing({ id: l.id, phase: l.phase || '', caption: l.caption || '' }); }}>Edit</button>
+                    <button type="button" className="tv-btn" style={prpBtn(saving, PRP_SMALL_BTN)} disabled={saving}
+                      aria-label={'Remove the link ' + (l.caption || l.url)}
+                      onClick={() => { setEditing(null); setConfirming(l.id); }}>Remove</button>
+                  </span>}
+            </React.Fragment>}
+      </div>;
+    })}
+    {links && <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <label htmlFor={idUrl} style={{ fontSize: 13, color: 'var(--text3)' }}>Add a link</label>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+        <input id={idUrl} className="tv-input" type="url" inputMode="url" maxLength={PRP_LINK_URL_MAX}
+          placeholder="Paste a Discord message link" style={{ flex: '1 1 260px', minWidth: 0, fontSize: 13 }}
+          value={url} disabled={saving || full} onChange={e => setUrl(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); add(); } }} />
+        <PerpsLinkPhaseSelect label="Phase of the new link" value={phase} disabled={saving || full} onChange={setPhase} />
+        <input className="tv-input" aria-label="Caption of the new link" maxLength={PRP_LINK_CAPTION_MAX} placeholder="Caption (optional)"
+          style={{ flex: '1 1 180px', minWidth: 0, fontSize: 13 }} value={caption} disabled={saving || full}
+          onChange={e => setCaption(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); add(); } }} />
+        <button type="button" className="tv-btn primary" style={prpBtn(!canAdd, PRP_SMALL_BTN)} disabled={!canAdd} onClick={add}>Add link</button>
+      </div>
+      {full && <span style={{ fontSize: 13, color: 'var(--warn)' }}>{PRP_LINK_LIMIT_TEXT}</span>}
+    </div>}
+    <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', minHeight: 0 }}>
+      <PerpsStatus saving={saving} status={status} />
+      {note && <span role="status" style={{ fontSize: 13, color: 'var(--text2)' }}>{note}</span>}
+    </div>
+  </div>;
+}
+
 function PerpsReviewButtons({ trade, saver }) {
   const followed = (trade.annotation || {}).followed_rules;
   function pick(value) {
@@ -1103,7 +1338,7 @@ function PerpsGatePrep({ missing }) {
   </div>;
 }
 
-function PerpsOpenRow({ trade: t, open, onToggle, hide, onSaved, advisor, tag, onTagSaved }) {
+function PerpsOpenRow({ trade: t, open, onToggle, hide, onSaved, advisor, tag, onTagSaved, linkCount, onLinkCount }) {
   const saver = prpUseSaver(t, onSaved);          // the Position card (a manual trade's close and delete)
   const planSaver = prpUseSaver(t, onSaved);      // the Plan card (the stop)
   const notesSaver = prpUseSaver(t, onSaved);     // the Notes card
@@ -1151,6 +1386,7 @@ function PerpsOpenRow({ trade: t, open, onToggle, hide, onSaved, advisor, tag, o
         <span style={{ fontWeight: 700, color: 'var(--text)', fontSize: 14 }}>
           {sym}{(t.annotation || {}).notes && String(t.annotation.notes).trim()
             ? <span title="Has trade notes" aria-label="Has trade notes" style={{ marginLeft: 6, color: 'var(--text3)', fontWeight: 400 }}>✎</span> : null}
+          <PerpsLinkCount n={linkCount} />
         </span>
         <span style={{ fontSize: 12, color: 'var(--text3)', overflowWrap: 'anywhere' }}>{prpVenueLine(t)}</span>
       </div>
@@ -1223,6 +1459,7 @@ function PerpsOpenRow({ trade: t, open, onToggle, hide, onSaved, advisor, tag, o
         <PerpsCard part="notes" title="Notes">
           <PerpsNotesEditor trade={t} saver={notesSaver} withDeviation={false} />
           <span style={{ fontSize: 13, color: 'var(--text3)' }}>Followed or deviated is set once the trade closes, on the Closed tab.</span>
+          <PerpsJournalLinks trade={t} onCountChange={onLinkCount} />
           <PerpsStatus saving={notesSaver.saving} status={notesSaver.status} />
         </PerpsCard>
       </div>
@@ -1265,7 +1502,7 @@ function PerpsUntrackedRow({ row: u, hide }) {
   </div>;
 }
 
-function PerpsOpenTab({ trades, untracked, expanded, onToggle, hide, onSaved, advisor, tags, onTagSaved }) {
+function PerpsOpenTab({ trades, untracked, expanded, onToggle, hide, onSaved, advisor, tags, onTagSaved, linkCounts, onLinkCount }) {
   const head = { fontSize: 12, lineHeight: '16px', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--text3)' };
   const right = { textAlign: 'right' };
   if (!trades.length && !untracked.length) {
@@ -1280,7 +1517,8 @@ function PerpsOpenTab({ trades, untracked, expanded, onToggle, hide, onSaved, ad
         <span className="spot-pad-left">Status</span>
       </div>
       {trades.map(t => <PerpsOpenRow key={t.trade_id} trade={t} open={!!expanded[t.trade_id]} onToggle={onToggle} hide={hide} onSaved={onSaved}
-        advisor={advisor} tag={tags[t.trade_id]} onTagSaved={onTagSaved} />)}
+        advisor={advisor} tag={tags[t.trade_id]} onTagSaved={onTagSaved}
+        linkCount={(linkCounts || {})[t.trade_id]} onLinkCount={onLinkCount} />)}
       {untracked.map(u => <PerpsUntrackedRow key={u.venue + '|' + u.wallet_label + '|' + u.symbol} row={u} hide={hide} />)}
     </div>
   </div>;
@@ -1288,7 +1526,7 @@ function PerpsOpenTab({ trades, untracked, expanded, onToggle, hide, onSaved, ad
 
 /* ── History ─────────────────────────────────────────────────────────── */
 
-function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart, gateCountFrom, advisor, tag, onTagSaved }) {
+function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart, gateCountFrom, advisor, tag, onTagSaved, linkCount, onLinkCount }) {
   const saver = prpUseSaver(t, onSaved);          // the Result card (a manual trade's delete)
   const planSaver = prpUseSaver(t, onSaved);      // the Plan card (the stop)
   const reviewSaver = prpUseSaver(t, onSaved);    // the Review card (followed / deviated, exit reason)
@@ -1328,6 +1566,7 @@ function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart, g
         <span style={{ fontWeight: 700, color: 'var(--text)', fontSize: 14 }}>
           {sym}{(t.annotation || {}).notes && String(t.annotation.notes).trim()
             ? <span title="Has trade notes" aria-label="Has trade notes" style={{ marginLeft: 6, color: 'var(--text3)', fontWeight: 400 }}>✎</span> : null}
+          <PerpsLinkCount n={linkCount} />
         </span>
         <span style={{ fontSize: 12, color: 'var(--text3)', overflowWrap: 'anywhere' }}>{prpVenueLine(t)}</span>
       </div>
@@ -1402,6 +1641,7 @@ function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart, g
         </PerpsCard>
         <PerpsCard part="notes" title="Notes">
           <PerpsNotesEditor trade={t} saver={notesSaver} withDeviation={true} />
+          <PerpsJournalLinks trade={t} onCountChange={onLinkCount} />
           <PerpsStatus saving={notesSaver.saving} status={notesSaver.status} />
         </PerpsCard>
       </div>
@@ -1423,7 +1663,7 @@ function PerpsUnattached({ items }) {
   </div>;
 }
 
-function PerpsHistoryTab({ trades, expanded, onToggle, hide, onSaved, gateStart, gateCountFrom, unattached, advisor, tags, onTagSaved }) {
+function PerpsHistoryTab({ trades, expanded, onToggle, hide, onSaved, gateStart, gateCountFrom, unattached, advisor, tags, onTagSaved, linkCounts, onLinkCount }) {
   const [earlier, setEarlierState] = usePRPState(() => prpReadLocal('perpsHistoryEarlier', '0') === '1');
   function setEarlier(v) { setEarlierState(v); prpWriteLocal('perpsHistoryEarlier', v ? '1' : '0'); }
   const earlierCount = trades.filter(t => t.before_rule).length;
@@ -1456,7 +1696,8 @@ function PerpsHistoryTab({ trades, expanded, onToggle, hide, onSaved, gateStart,
         </div>
         {rows.map(t => <PerpsHistoryRow key={t.trade_id} trade={t} open={!!expanded[t.trade_id]} onToggle={onToggle}
           hide={hide} onSaved={onSaved} gateStart={gateStart} gateCountFrom={gateCountFrom}
-          advisor={advisor} tag={tags[t.trade_id]} onTagSaved={onTagSaved} />)}
+          advisor={advisor} tag={tags[t.trade_id]} onTagSaved={onTagSaved}
+          linkCount={(linkCounts || {})[t.trade_id]} onLinkCount={onLinkCount} />)}
       </div>}
     <div style={{ fontSize: 13, color: 'var(--text3)', marginTop: 10 }}>
       * R from prices (manual trades have no fee data). R uses the stop in force 10 minutes after entry, so a stop corrected right after opening counts as the plan. "plan" under R is the first take-profit you set, in R from entry to the stop (by price, before fees). Lev on closed synced trades comes from the trade-open snapshot; trades closed before it existed show "—". After exit: best and worst during the trade are in R by price against that stop; "had you held the plan" follows your first take-profit and that stop from the open to 14 days after the exit, and one candle touching both counts as unclear.
@@ -1804,7 +2045,10 @@ function PerpsScreen({ hideValues, refreshTrigger }) {
   const [rulesLoading, setRulesLoading] = usePRPState(false);
   const [rulesError, setRulesError] = usePRPState(null);
   const [tags, setTags] = usePRPState({});
+  const [linkCounts, setLinkCounts] = usePRPState({});
   const reqRef = usePRPRef(0);
+  const linksReqRef = usePRPRef(0);
+  const linksEpochRef = usePRPRef(0);     // bumped by every link add or remove: a GET started before it is ignored
   const rulesReqRef = usePRPRef(0);
   const tagsReqRef = usePRPRef(0);
   const tagsEpochRef = usePRPRef(0);      // bumped by every tag save: a GET started before it is ignored
@@ -1818,6 +2062,7 @@ function PerpsScreen({ hideValues, refreshTrigger }) {
   function load() {
     const mine = ++reqRef.current;
     setLoading(true);
+    loadLinkCounts();
     api('/api/trading/trades').then(d => {
       if (mine !== reqRef.current) return;
       if (!d || !Array.isArray(d.trades) || !d.summary) throw new Error('Unexpected response');
@@ -1862,6 +2107,28 @@ function PerpsScreen({ hideValues, refreshTrigger }) {
     });
   }
 
+  // Landing 97: journal-link counts for the symbol lines. Fetched beside the
+  // trades, never waited on; a failed read leaves the counts as they are.
+  function loadLinkCounts() {
+    const mine = ++linksReqRef.current;
+    const epoch = linksEpochRef.current;
+    api('/api/trading/trade-links/counts').then(d => {
+      if (mine !== linksReqRef.current || epoch !== linksEpochRef.current) return;
+      if (d && d.counts && typeof d.counts === 'object') setLinkCounts(d.counts);
+    }).catch(() => { /* no counts shown; nothing else depends on them */ });
+  }
+
+  // A row added or removed a link: its count changes here, with no reload.
+  function onLinkCount(tradeId, n) {
+    linksEpochRef.current += 1;
+    linksReqRef.current += 1;
+    setLinkCounts(prev => {
+      const next = Object.assign({}, prev);
+      if (n > 0) next[tradeId] = n; else delete next[tradeId];
+      return next;
+    });
+  }
+
   function loadTags() {
     const mine = ++tagsReqRef.current;
     const epoch = tagsEpochRef.current;
@@ -1895,6 +2162,7 @@ function PerpsScreen({ hideValues, refreshTrigger }) {
     return () => {
       reqRef.current += 1;              // late answers are ignored after unmount
       rulesReqRef.current += 1;
+      linksReqRef.current += 1;
       tagsReqRef.current += 1;
       clearTimeout(coldTimerRef.current);
     };
@@ -1979,9 +2247,11 @@ function PerpsScreen({ hideValues, refreshTrigger }) {
     </div>
 
     {tab === 'open' && <PerpsOpenTab trades={openTrades} untracked={untracked} expanded={expanded} onToggle={toggle}
-      hide={hideValues} onSaved={onSavedAll} advisor={advisor} tags={tags} onTagSaved={onTagSaved} />}
+      hide={hideValues} onSaved={onSavedAll} advisor={advisor} tags={tags} onTagSaved={onTagSaved}
+      linkCounts={linkCounts} onLinkCount={onLinkCount} />}
     {tab === 'history' && <PerpsHistoryTab trades={closedTrades} expanded={expanded} onToggle={toggle} hide={hideValues}
-      onSaved={onSavedAll} gateStart={gateStart} gateCountFrom={gateCountFrom} unattached={unattached} advisor={advisor} tags={tags} onTagSaved={onTagSaved} />}
+      onSaved={onSavedAll} gateStart={gateStart} gateCountFrom={gateCountFrom} unattached={unattached} advisor={advisor} tags={tags} onTagSaved={onTagSaved}
+      linkCounts={linkCounts} onLinkCount={onLinkCount} />}
     {tab === 'transactions' && <PerpsTransactionsTab trades={perps} sync={data.sync} hide={hideValues} onSaved={onSavedAll} onJump={jump} />}
     {tab === 'rules' && <PerpsRulesTab advisor={advisor} hide={hideValues} onChanged={onSavedAll} gate={data.summary.gate || null} />}
 
